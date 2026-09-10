@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import math, random, threading, time, statistics
 from live_data import fetch_ffwc_current
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder='.')
 
 MYMENSINGH_REAL = [
 ('2026-05-09 09:00:00',9.29),('2026-05-09 12:00:00',9.23),('2026-05-09 15:00:00',9.18),('2026-05-09 18:00:00',9.13),
