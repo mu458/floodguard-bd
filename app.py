@@ -1,4 +1,4 @@
-from flask import Flask, render_template, jsonify, request, Response, session
+from flask import Flask, render_template, jsonify, request, Response, session, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, timezone
 import math, random, threading, time, statistics, os, sqlite3, re
@@ -211,7 +211,12 @@ def make_simple_summary(z):
     return {'headline':headline,'sub':sub}
 
 @app.route('/')
-def index(): return render_template('index.html')
+def index():
+    # Serve the root index.html directly so deployment does not depend on templates/ being uploaded.
+    root_index = os.path.join(BASE, 'index.html')
+    if os.path.exists(root_index):
+        return send_file(root_index)
+    return render_template('index.html')
 @app.route('/api/zones')
 def zones(): return jsonify([package_station(k) for k in STATIONS])
 @app.route('/api/dashboard')
