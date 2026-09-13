@@ -1,10 +1,15 @@
-from flask import Flask, render_template, jsonify, request, Response
+from flask import Flask, render_template, jsonify, request, Response, session
+from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, timezone
-import math, random, threading, time, statistics
+import math, random, threading, time, statistics, os, sqlite3, re
 from live_data import fetch_ffwc_current
 
-app = Flask(__name__, template_folder='.')
+BASE = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE, 'floodguard.db')
+app = Flask(__name__, template_folder='templates', static_folder='static')
+app.secret_key = os.environ.get('SECRET_KEY', 'floodguard-dev-secret-change-me')
 
+# User-provided Mymensingh readings retained as historical project observations.
 MYMENSINGH_REAL = [
 ('2026-05-09 09:00:00',9.29),('2026-05-09 12:00:00',9.23),('2026-05-09 15:00:00',9.18),('2026-05-09 18:00:00',9.13),
 ('2026-05-10 06:00:00',8.87),('2026-05-10 09:00:00',8.82),('2026-05-10 12:00:00',8.75),('2026-05-10 15:00:00',8.69),('2026-05-10 18:00:00',8.64),
@@ -13,260 +18,257 @@ MYMENSINGH_REAL = [
 ('2026-05-13 06:00:00',7.80),('2026-05-13 09:00:00',7.78),('2026-05-13 12:00:00',7.79),('2026-05-13 15:00:00',7.80),('2026-05-13 18:00:00',7.78),
 ('2026-05-14 06:00:00',7.76),('2026-05-14 09:00:00',7.76),('2026-05-14 12:00:00',7.75),('2026-05-14 15:00:00',7.75),('2026-05-14 18:00:00',7.74),
 ('2026-05-15 06:00:00',8.11),('2026-05-15 09:00:00',8.36),('2026-05-15 12:00:00',9.06),('2026-05-15 15:00:00',9.96),('2026-05-15 18:00:00',10.86),
-('2026-05-16 06:00:00',11.64),('2026-05-16 09:00:00',11.68)]
+('2026-05-16 06:00:00',11.64),('2026-05-16 09:00:00',11.68)
+]
 
+# Representative station set. Danger-level values are configuration references, not claims of current official measurements.
 STATIONS = {
- 'mymensingh': {'name':'Mymensingh — Old Brahmaputra','district':'Mymensingh','division':'Mymensingh','river':'Old Brahmaputra','station':'Mymensingh','danger':12.05,'lat':24.747,'lon':90.420,'target':11.68},
- 'jamalpur': {'name':'Jamalpur — Old Brahmaputra','district':'Jamalpur','division':'Mymensingh','river':'Old Brahmaputra','station':'Jamalpur','danger':16.55,'lat':24.937,'lon':89.937,'target':15.10},
- 'sylhet': {'name':'Sylhet — Surma','district':'Sylhet','division':'Sylhet','river':'Surma','station':'Sylhet','danger':10.50,'lat':24.895,'lon':91.869,'target':10.15},
- 'sunamganj': {'name':'Sunamganj — Surma','district':'Sunamganj','division':'Sylhet','river':'Surma','station':'Sunamganj','danger':7.20,'lat':25.066,'lon':91.395,'target':6.30},
- 'kurigram': {'name':'Kurigram — Dharla','district':'Kurigram','division':'Rangpur','river':'Dharla','station':'Kurigram','danger':26.50,'lat':25.805,'lon':89.636,'target':27.05},
- 'gaibandha': {'name':'Gaibandha — Ghaghat','district':'Gaibandha','division':'Rangpur','river':'Ghaghat','station':'Gaibandha','danger':21.25,'lat':25.329,'lon':89.542,'target':18.30},
- 'sirajganj': {'name':'Sirajganj — Jamuna','district':'Sirajganj','division':'Rajshahi','river':'Jamuna','station':'Sirajganj','danger':13.35,'lat':24.453,'lon':89.700,'target':13.00},
- 'rajshahi': {'name':'Rajshahi — Padma','district':'Rajshahi','division':'Rajshahi','river':'Padma','station':'Rajshahi','danger':18.50,'lat':24.374,'lon':88.604,'target':15.80},
+ 'mymensingh': {'name':'Mymensingh — Old Brahmaputra','district':'Mymensingh','division':'Mymensingh','river':'Old Brahmaputra','station':'Mymensingh','danger':12.05,'lat':24.747,'lon':90.420,'seed':11,'base':7.1,'wave':0.16},
+ 'jamalpur': {'name':'Jamalpur — Old Brahmaputra','district':'Jamalpur','division':'Mymensingh','river':'Old Brahmaputra','station':'Jamalpur','danger':16.55,'lat':24.937,'lon':89.937,'seed':12,'base':11.8,'wave':0.20},
+ 'tangail': {'name':'Tangail — Dhaleshwari','district':'Tangail','division':'Dhaka','river':'Dhaleshwari','station':'Tangail','danger':7.95,'lat':24.251,'lon':89.916,'seed':13,'base':5.9,'wave':0.14},
+ 'sylhet': {'name':'Sylhet — Surma','district':'Sylhet','division':'Sylhet','river':'Surma','station':'Sylhet','danger':10.50,'lat':24.895,'lon':91.869,'seed':14,'base':8.4,'wave':0.18},
+ 'sunamganj': {'name':'Sunamganj — Surma','district':'Sunamganj','division':'Sylhet','river':'Surma','station':'Sunamganj','danger':7.20,'lat':25.066,'lon':91.395,'seed':15,'base':5.8,'wave':0.13},
+ 'netrokona': {'name':'Netrokona — Kangsha','district':'Netrokona','division':'Mymensingh','river':'Kangsha','station':'Netrokona','danger':10.10,'lat':24.883,'lon':90.727,'seed':16,'base':7.5,'wave':0.17},
+ 'kurigram': {'name':'Kurigram — Dharla','district':'Kurigram','division':'Rangpur','river':'Dharla','station':'Kurigram','danger':26.50,'lat':25.805,'lon':89.636,'seed':17,'base':24.7,'wave':0.28},
+ 'gaibandha': {'name':'Gaibandha — Ghaghat','district':'Gaibandha','division':'Rangpur','river':'Ghaghat','station':'Gaibandha','danger':21.25,'lat':25.329,'lon':89.542,'seed':18,'base':17.4,'wave':0.21},
+ 'nilphamari': {'name':'Nilphamari — Teesta','district':'Nilphamari','division':'Rangpur','river':'Teesta','station':'Nilphamari','danger':21.00,'lat':25.932,'lon':88.856,'seed':19,'base':18.1,'wave':0.22},
+ 'sirajganj': {'name':'Sirajganj — Jamuna','district':'Sirajganj','division':'Rajshahi','river':'Jamuna','station':'Sirajganj','danger':13.35,'lat':24.453,'lon':89.700,'seed':20,'base':11.3,'wave':0.18},
+ 'bogura': {'name':'Bogura — Karatoya','district':'Bogura','division':'Rajshahi','river':'Karatoya','station':'Bogura','danger':16.85,'lat':24.849,'lon':89.374,'seed':21,'base':13.7,'wave':0.15},
+ 'rajshahi': {'name':'Rajshahi — Padma','district':'Rajshahi','division':'Rajshahi','river':'Padma','station':'Rajshahi','danger':18.50,'lat':24.374,'lon':88.604,'seed':22,'base':15.1,'wave':0.18},
+ 'chapainawabganj': {'name':'Chapainawabganj — Mahananda','district':'Chapainawabganj','division':'Rajshahi','river':'Mahananda','station':'Chapainawabganj','danger':20.80,'lat':24.596,'lon':88.277,'seed':23,'base':17.6,'wave':0.17},
+ 'faridpur': {'name':'Faridpur — Padma','district':'Faridpur','division':'Dhaka','river':'Padma','station':'Faridpur','danger':9.65,'lat':23.607,'lon':89.842,'seed':24,'base':8.0,'wave':0.13},
+ 'madaripur': {'name':'Madaripur — Arial Khan','district':'Madaripur','division':'Dhaka','river':'Arial Khan','station':'Madaripur','danger':6.80,'lat':23.165,'lon':90.195,'seed':25,'base':5.7,'wave':0.11},
+ 'barishal': {'name':'Barishal — Kirtankhola','district':'Barishal','division':'Barishal','river':'Kirtankhola','station':'Barishal','danger':2.95,'lat':22.701,'lon':90.353,'seed':26,'base':2.35,'wave':0.08},
+ 'khulna': {'name':'Khulna — Rupsa','district':'Khulna','division':'Khulna','river':'Rupsa','station':'Khulna','danger':2.55,'lat':22.845,'lon':89.540,'seed':27,'base':1.95,'wave':0.06},
+ 'jessore': {'name':'Jashore — Bhairab','district':'Jashore','division':'Khulna','river':'Bhairab','station':'Jashore','danger':4.80,'lat':23.167,'lon':89.216,'seed':28,'base':3.95,'wave':0.09},
+ 'chattogram': {'name':'Chattogram — Karnaphuli','district':'Chattogram','division':'Chattogram','river':'Karnaphuli','station':'Chattogram','danger':5.35,'lat':22.356,'lon':91.783,'seed':29,'base':4.10,'wave':0.12},
+ 'feni': {'name':'Feni — Muhuri','district':'Feni','division':'Chattogram','river':'Muhuri','station':'Feni','danger':4.35,'lat':23.015,'lon':91.396,'seed':30,'base':3.45,'wave':0.11},
 }
 
-# Latest known FFWC bulletin snapshots supplied for this project.
-# These are used only when the public feed cannot be read; they are never labelled as live.
+# Official bulletin snapshot values supplied in the chat. Never labelled as live.
 FFWC_BULLETIN_SNAPSHOT = {
     'mymensingh': {'current': 6.32, 'danger': 12.05, 'observed_at': '2026-09-09 09:00', 'source': 'FFWC bulletin snapshot'},
     'jamalpur': {'current': 12.14, 'danger': 16.55, 'observed_at': '2026-09-09 09:00', 'source': 'FFWC bulletin snapshot'},
 }
 
-LIVE_CACHE = {
-    'payload': None,
-    'expires': 0,
-    'error': None,
-    'state': 'idle',
-    'last_attempt': None,
-}
-CACHE_SECONDS = 300
-_cache_lock = threading.Lock()
-_worker_lock = threading.Lock()
-_worker_running = False
+LIVE_CACHE = {'payload': None, 'expires': 0, 'error': None, 'state': 'idle', 'last_attempt': None}
+CACHE_SECONDS = int(os.environ.get('LIVE_REFRESH_SECONDS', '300'))
+_cache_lock = threading.Lock(); _worker_lock = threading.Lock(); _worker_running = False
+
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+def init_db():
+    con = db()
+    con.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, zone TEXT, language TEXT DEFAULT "en", whatsapp TEXT, alerts INTEGER DEFAULT 0)')
+    con.commit(); con.close()
+
+init_db()
 
 def _live_worker():
     global _worker_running
     try:
         with _cache_lock:
-            LIVE_CACHE['state']='syncing'
-            LIVE_CACHE['last_attempt']=datetime.now(timezone.utc).isoformat()
-        payload = fetch_ffwc_current()
+            LIVE_CACHE['state']='syncing'; LIVE_CACHE['last_attempt']=datetime.now(timezone.utc).isoformat()
+        payload=fetch_ffwc_current()
         with _cache_lock:
             LIVE_CACHE.update(payload=payload, expires=time.time()+CACHE_SECONDS, error=None, state='connected')
     except Exception as exc:
         with _cache_lock:
-            LIVE_CACHE['error']=str(exc)
-            LIVE_CACHE['state']='unavailable' if not LIVE_CACHE.get('payload') else 'stale'
+            LIVE_CACHE['error']=str(exc); LIVE_CACHE['state']='stale' if LIVE_CACHE.get('payload') else 'unavailable'
     finally:
-        with _worker_lock:
-            _worker_running=False
+        with _worker_lock: _worker_running=False
 
 def trigger_live_refresh(force=False):
     global _worker_running
-    now=time.time()
     with _worker_lock:
-        if _worker_running:
-            return False
-        if (not force and LIVE_CACHE.get('payload') and now < LIVE_CACHE.get('expires',0)):
+        now=time.time()
+        if _worker_running or (not force and LIVE_CACHE.get('payload') and now < LIVE_CACHE.get('expires',0)):
             return False
         _worker_running=True
-        threading.Thread(target=_live_worker, daemon=True).start()
-        return True
+        threading.Thread(target=_live_worker, daemon=True).start(); return True
 
-def live_snapshot(force=False):
-    # Never perform network I/O in a Flask request. Return cached data immediately.
-    # Live refresh is handled by a background worker.
+@app.before_request
+def _ensure_background_live_sync():
+    # Never block a page request. If the cache is stale/empty, launch one background refresh.
+    trigger_live_refresh(False)
+
+def live_snapshot():
     with _cache_lock:
-        payload = LIVE_CACHE.get('payload')
-        state = LIVE_CACHE.get('state', 'idle')
-    if payload:
-        return payload
-    # First load: use an empty live snapshot and let the background worker update it.
-    return {'ok': False, 'source': 'background sync', 'source_url': 'https://ffwc.gov.bd/app/observed-water-level',
-            'fetched_at': None, 'table_date': None, 'data': {}, 'state': state}
+        payload=LIVE_CACHE.get('payload'); state=LIVE_CACHE.get('state','idle'); err=LIVE_CACHE.get('error')
+    if payload: return payload
+    return {'ok':False,'source':'FFWC public feed','source_url':'https://ffwc.gov.bd/app/observed-water-level','fetched_at':None,'table_date':None,'data':{},'state':state,'error':err}
 
-def re_key(x):
-    return ''.join(ch for ch in str(x).lower() if ch.isalnum())
+def norm(x): return ''.join(ch for ch in str(x).lower() if ch.isalnum())
 
-
-def live_for_station(key, force=False):
-    st = STATIONS[key]
-    snap = live_snapshot()
-    data = snap.get('data', {})
-    target = (re_key(st['river']), re_key(st['station']))
-    hit = data.get(target)
-    if hit:
-        return {**hit, 'live': True}
-    station_norm = re_key(st['station'])
-    for (_, sta), v in data.items():
-        if sta == station_norm:
-            return {**v, 'live': True}
+def live_for_station(key):
+    st=STATIONS[key]; snap=live_snapshot(); data=snap.get('data',{})
+    target=(norm(st['river']),norm(st['station']))
+    hit=data.get(target)
+    if hit: return {**hit,'live':True}
+    for (river,station),v in data.items():
+        if station==norm(st['station']) or (station in norm(st['station']) or norm(st['station']) in station):
+            return {**v,'live':True}
     snaprow=FFWC_BULLETIN_SNAPSHOT.get(key)
     if snaprow:
-        return {'live': False, 'source': snaprow['source'], 'current': snaprow['current'], 'danger': snaprow['danger'], 'observed_at': snaprow['observed_at'], 'source_url': 'https://ffwc.gov.bd/app/daily-waterlevel-report', 'snapshot': True}
-    return {'live': False, 'source': 'reference data', 'current': st['target'], 'danger': st['danger'], 'observed_at': None, 'source_url': snap.get('source_url'), 'snapshot': False}
+        return {**snaprow,'live':False,'snapshot':True,'source_url':'https://ffwc.gov.bd/app/daily-waterlevel-report'}
+    return simulated_current(key)
 
+def simulated_current(key):
+    st=STATIONS[key]; now=datetime.now(timezone.utc); seconds=(now.hour*3600+now.minute*60+now.second)
+    day_index=(now.date()-datetime(2026,1,1).date()).days
+    phase=(day_index*0.39)+(seconds/86400)*2*math.pi
+    rng=random.Random(st['seed'])
+    trend=0.14*math.sin(phase/2.4)+0.07*math.sin(phase/5.1)
+    spike=0.0
+    if st['seed'] % 4 == 0: spike=0.45*math.sin(phase*1.7)
+    current=max(0, st['base']+st['wave']*math.sin(phase)+trend+spike)
+    return {'live':False,'simulation':True,'source':'FloodGuard simulation scenario','current':round(current,2),'danger':st['danger'],'observed_at':now.astimezone().strftime('%Y-%m-%d %H:%M:%S'),'source_url':'https://ffwc.gov.bd/app/observed-water-level'}
 
-def make_demo_history(key):
-    if key == 'mymensingh':
-        rows=[{'time':t,'level':v,'kind':'Historical reading'} for t,v in MYMENSINGH_REAL]
-        start=datetime.strptime(MYMENSINGH_REAL[0][0],'%Y-%m-%d %H:%M:%S')-timedelta(hours=3*56)
-        rng=random.Random(11)
-        for i in range(56):
-            dt=start+timedelta(hours=3*i)
-            val=9.8-0.035*i+0.10*math.sin(i/3)+rng.uniform(-0.025,0.025)
-            rows.append({'time':dt.strftime('%Y-%m-%d %H:%M:%S'),'level':val,'kind':'Historical extension'})
+def make_history(key, current):
+    if key=='mymensingh':
+        rows=[{'time':t,'level':v,'kind':'Project observation'} for t,v in MYMENSINGH_REAL]
+        rng=random.Random(91)
+        start=datetime.strptime(MYMENSINGH_REAL[0][0],'%Y-%m-%d %H:%M:%S')-timedelta(hours=3*90)
+        for i in range(90):
+            dt=start+timedelta(hours=3*i); val=9.65-0.022*i+0.10*math.sin(i/3)+rng.uniform(-0.03,0.03)
+            rows.append({'time':dt.strftime('%Y-%m-%d %H:%M:%S'),'level':round(val,2),'kind':'Historical context'})
         rows.sort(key=lambda x:x['time'])
+        rows[-1]={'time':datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S'),'level':current,'kind':'Latest available observation/model state'}
         return rows
-    st=STATIONS[key]
-    rng=random.Random(sum(ord(c) for c in key))
-    end=datetime(2026,5,16,9)
-    start=end-timedelta(hours=3*159)
-    start_level=st['target']-rng.uniform(-0.35,0.55)
-    rows=[]
-    for i in range(160):
-        dt=start+timedelta(hours=3*i)
-        progress=i/159
-        event=0
-        if key in {'sylhet','kurigram','sirajganj'} and i>128: event=(i-128)*0.055
-        if key=='sunamganj' and i>118: event=(i-118)*0.020
-        level=start_level+(st['target']-start_level)*progress+0.12*math.sin(i/6)+0.05*math.sin(i/18)+event+rng.uniform(-0.045,0.045)
-        rows.append({'time':dt.strftime('%Y-%m-%d %H:%M:%S'),'level':level,'kind':'Historical extension'})
-    rows[-1]['level']=st['target']
+    st=STATIONS[key]; rng=random.Random(st['seed']); rows=[]; now=datetime.now().astimezone().replace(minute=0,second=0,microsecond=0)
+    start=now-timedelta(hours=3*95)
+    for i in range(96):
+        dt=start+timedelta(hours=3*i); progress=i/95
+        val=st['base'] + (current-st['base'])*progress + st['wave']*math.sin(i/6)+0.06*math.sin(i/14)+rng.uniform(-0.035,0.035)
+        rows.append({'time':dt.strftime('%Y-%m-%d %H:%M:%S'),'level':round(val,2),'kind':'Recorded / scenario history'})
+    rows[-1]={'time':now.strftime('%Y-%m-%d %H:%M:%S'),'level':current,'kind':'Latest state'}
     return rows
 
-
-def risk_for(level, danger):
-    ratio=level/danger if danger else 0
-    if ratio >= 1.02: return 'SEVERE'
-    if ratio >= .96: return 'FLOOD'
-    if ratio >= .86: return 'WARNING'
+def risk_for(level,danger):
+    r=level/danger if danger else 0
+    if r>=1.02:return 'SEVERE'
+    if r>=0.96:return 'FLOOD'
+    if r>=0.86:return 'WARNING'
     return 'NORMAL'
 
-
-def predict_24h(current, previous, danger):
-    slope = current - previous
-    predicted = max(0, current + slope * 8)
+def predict_24h(history,current,danger):
+    if len(history)>=4:
+        recent=[x['level'] for x in history[-5:]]; slope=(recent[-1]-recent[0])/4
+    else:slope=0
+    predicted=max(0,current+slope*8)
     probability=max(2,min(98,round(100/(1+math.exp(-((predicted/danger)-.86)*18)))))
-    return round(predicted,2),probability,risk_for(predicted,danger),round(slope,3)
+    return round(predicted,2),probability,risk_for(predicted,danger),round(slope,4)
 
-
-def forecast_15_days(current, slope, danger):
-    today=datetime.now().astimezone()
-    out=[]
+def forecast_15_days(current,slope,danger,key):
+    # Stable all-zone 15-day projection; deterministic per zone and anchored to current state.
+    today=datetime.now().astimezone(); out=[]; st=STATIONS[key]
+    rng=random.Random(st['seed']*17)
     for day in range(1,16):
-        decay=0.80**(day-1)
-        wave=0.10*math.sin(day/2)
-        level=max(0,current+slope*8*day*decay+wave)
-        level=round(level,2)
-        prob=max(2,min(99,round(100/(1+math.exp(-((level/danger)-.86)*18)))))
-        out.append({'date':(today+timedelta(days=day)).strftime('%Y-%m-%d'),'level':level,'probability':prob,'risk':risk_for(level,danger)})
+        decay=0.92**(day-1)
+        cyc=0.08*math.sin((day+st['seed'])/2.2)
+        event=0.04*math.sin(day/1.8+st['seed'])
+        level=max(0,current + slope*8*day*decay + cyc + event)
+        # Clamp into a sensible range around the danger reference.
+        level=min(level, danger*1.18); level=max(level, 0.05)
+        prob=max(1,min(99,round(100/(1+math.exp(-((level/danger)-.86)*18)))))
+        uncertainty=round(0.05+day*0.012,2)
+        out.append({'date':(today+timedelta(days=day)).strftime('%Y-%m-%d'),'level':round(level,2),'probability':prob,'risk':risk_for(level,danger),'uncertainty':uncertainty})
     return out
 
+def package_station(key):
+    st=STATIONS[key]; live=live_for_station(key); current=float(live.get('current',st['base'])); danger=float(live.get('danger',st['danger']))
+    hist=make_history(key,current); pred,prob,risk,slope=predict_24h(hist,current,danger); f15=forecast_15_days(current,slope,danger,key)
+    status='LIVE' if live.get('live') else ('FFWC SNAPSHOT' if live.get('snapshot') else 'SIMULATION')
+    return {'id':key,'name':st['name'],'district':st['district'],'division':st['division'],'river':st['river'],'station':st['station'],'current':round(current,2),'predicted':pred,'probability':prob,'risk':risk,'danger':round(danger,2),'lat':st['lat'],'lon':st['lon'],'trend_3h_cm':round(slope*100,1),'live':bool(live.get('live')),'simulation':bool(live.get('simulation')),'snapshot':bool(live.get('snapshot')),'status':status,'source':live.get('source','FFWC'),'source_url':live.get('source_url'),'observed_at':live.get('observed_at'),'fetched_at':live_snapshot().get('fetched_at'),'forecast15':f15,'day15':f15[-1]['level'],'day15risk':f15[-1]['risk']}
+
+def build_dashboard(key):
+    if key not in STATIONS:key='mymensingh'
+    z=package_station(key); hist=make_history(key,z['current'])
+    pred,prob,risk,slope=predict_24h(hist,z['current'],z['danger'])
+    risk_now=z['risk']
+    simple=make_simple_summary(z)
+    return {'station':z,'current':z['current'],'predicted':pred,'probability':prob,'risk':risk_now,'trend_per_3h':slope,'forecast15':z['forecast15'],'history':hist,'advice':advice(risk_now),'simple':simple,'live_connected':bool(z['live'])}
 
 def advice(risk):
     return {
-      'NORMAL':['Continue monitoring official updates.','Keep phone, torch and power bank charged.','Know the nearest safe higher ground or shelter.'],
-      'WARNING':['Check FFWC/BWDB and local-authority updates frequently.','Prepare water, dry food, medicines and important documents.','Move valuables and electrical items higher and plan an evacuation route.'],
-      'FLOOD':['Avoid unnecessary travel near rivers and fast-moving water.','Move valuables, documents, livestock and essential supplies higher.','Prepare for evacuation if local authorities advise it.'],
-      'SEVERE':['Follow official/local-authority instructions immediately.','Move to higher ground or a designated shelter when instructed.','Keep emergency supplies and essential medicines with you.']
+      'NORMAL':['Monitor official updates.','Keep phones and power banks charged.','Know the nearest safe high ground or shelter.'],
+      'WARNING':['Check official and local-authority updates regularly.','Prepare water, dry food, medicines and important documents.','Move valuables and electrical items higher and plan an evacuation route.'],
+      'FLOOD':['Avoid unnecessary travel near rivers and fast-moving water.','Move valuables, documents, livestock and essentials higher.','Prepare for evacuation if local authorities advise it.'],
+      'SEVERE':['Follow local-authority emergency instructions immediately.','Move to higher ground or a designated shelter when instructed.','Keep essential medicines and emergency supplies with you.']
     }[risk]
 
-
-def package_station(key, force=False):
-    st=STATIONS[key]
-    live=live_for_station(key, force)
-    current=float(live.get('current',st['target']))
-    danger=float(live.get('danger',st['danger']))
-    rows=make_demo_history(key)
-    previous=float(rows[-1]['level'])
-    pred,prob,risk,slope=predict_24h(current,previous,danger)
-    forecast=forecast_15_days(current,slope,danger)
-    snap=live_snapshot()
-    return {
-        'id':key,'name':st['name'],'district':st['district'],'division':st['division'],'river':st['river'],'station':st['station'],
-        'current':round(current,2),'predicted':pred,'probability':prob,'risk':risk,'danger':round(danger,2),'lat':st['lat'],'lon':st['lon'],
-        'trend_3h_cm':round(slope*100,1),'live':bool(live.get('live')),'source':live.get('source','FFWC' if live.get('live') else 'reference data'),
-        'snapshot':bool(live.get('snapshot')),
-        'source_url':live.get('source_url','https://ffwc.gov.bd/app/observed-water-level'),'observed_at':live.get('observed_at'),
-        'fetched_at':snap.get('fetched_at'),'forecast15':forecast,'day15':forecast[-1]['level'],'day15risk':forecast[-1]['risk']
-    }
-
-
-def build_dashboard(key, force=False):
-    st=STATIONS[key]
-    live=live_for_station(key, force)
-    current=float(live.get('current',st['target']))
-    danger=float(live.get('danger',st['danger']))
-    rows=make_demo_history(key)
-    previous=float(rows[-1]['level'])
-    pred,prob,risk,slope=predict_24h(current,previous,danger)
-    forecast=forecast_15_days(current,slope,danger)
-    hist=rows[-119:] + [{'time':datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S'),'level':current,'kind':'FFWC live observation' if live.get('live') else 'Fallback demo reference'}]
-    snap=live_snapshot()
-    return {
-      'station':{**st,'danger':danger,'source':live.get('source'),'source_url':live.get('source_url'),'live':bool(live.get('live')),'snapshot':bool(live.get('snapshot')),'observed_at':live.get('observed_at')},
-      'current':round(current,2),'predicted':pred,'probability':prob,'risk':risk,'trend_per_3h':slope,'forecast15':forecast,'history':hist,
-      'advice':advice(risk),'fetched_at':snap.get('fetched_at'),'table_date':snap.get('table_date'),
-      'live_connected':bool(snap.get('ok')),'live_error':None if snap.get('ok') else LIVE_CACHE.get('error')
-    }
-
-
-def national_summary(force=False):
-    zones=[package_station(k,force) for k in STATIONS]
-    counts={r:sum(1 for z in zones if z['risk']==r) for r in ['NORMAL','WARNING','FLOOD','SEVERE']}
-    rises=sorted(zones,key=lambda z:z['trend_3h_cm'],reverse=True)
-    closest=sorted(zones,key=lambda z:(z['current']/z['danger']),reverse=True)
-    return {'zones':zones,'counts':counts,'stations':len(zones),'live_stations':sum(z['live'] for z in zones),'top_rising':rises[:4],'closest_to_danger':closest[:4]}
+def make_simple_summary(z):
+    gap=z['danger']-z['current']; direction='rising' if z['trend_3h_cm']>0.2 else ('falling' if z['trend_3h_cm']<-0.2 else 'fairly steady')
+    if z['risk']=='SEVERE': headline=f"Severe flood risk near {z['district']}. Water level is {direction} and needs immediate attention."
+    elif z['risk']=='FLOOD': headline=f"Flood conditions are possible in {z['district']}. Water level is {direction}; keep essentials ready."
+    elif z['risk']=='WARNING': headline=f"Flood risk is increasing in {z['district']}. Water level is {direction}; stay alert."
+    else: headline=f"Conditions are currently calmer in {z['district']}. Water level is {direction}; keep monitoring updates."
+    if gap>=0: sub=f"Current level {z['current']:.2f} m; {gap:.2f} m below the reference danger level."
+    else: sub=f"Current level {z['current']:.2f} m; {abs(gap):.2f} m above the reference danger level."
+    return {'headline':headline,'sub':sub}
 
 @app.route('/')
-def index():
-    return render_template('index.html', stations=STATIONS)
-
+def index(): return render_template('index.html')
 @app.route('/api/zones')
-def zones():
-    return jsonify([package_station(k, request.args.get('force')=='1') for k in STATIONS])
-
+def zones(): return jsonify([package_station(k) for k in STATIONS])
 @app.route('/api/dashboard')
-def dashboard():
-    key=request.args.get('station','mymensingh')
-    if key not in STATIONS: key='mymensingh'
-    return jsonify(build_dashboard(key, request.args.get('force')=='1'))
-
+def dashboard(): return jsonify(build_dashboard(request.args.get('station','mymensingh')))
 @app.route('/api/national')
 def national():
-    return jsonify(national_summary(request.args.get('force')=='1'))
-
+    zones=[package_station(k) for k in STATIONS]; counts={r:sum(z['risk']==r for z in zones) for r in ['NORMAL','WARNING','FLOOD','SEVERE']}
+    return jsonify({'zones':zones,'counts':counts,'stations':len(zones),'live_stations':sum(z['live'] for z in zones)})
 @app.route('/api/live-refresh')
 def live_refresh():
-    started = trigger_live_refresh(force=request.args.get('force')=='1')
-    snap = live_snapshot()
-    return jsonify({'started': started, 'state': LIVE_CACHE.get('state','idle'), 'connected': bool(snap.get('ok')),
-                    'fetched_at': snap.get('fetched_at'), 'table_date': snap.get('table_date')})
-
+    started=trigger_live_refresh(force=request.args.get('force')=='1'); snap=live_snapshot()
+    return jsonify({'started':started,'state':LIVE_CACHE.get('state'),'connected':bool(snap.get('ok')),'fetched_at':snap.get('fetched_at'),'table_date':snap.get('table_date')})
 @app.route('/api/live-status')
 def live_status():
-    snap=live_snapshot(request.args.get('force')=='1')
-    return jsonify({'connected':bool(snap.get('ok')),'source':snap.get('source'),'source_url':snap.get('source_url'),'fetched_at':snap.get('fetched_at'),'table_date':snap.get('table_date'),'cache_seconds':CACHE_SECONDS,'state':LIVE_CACHE.get('state','idle'),'error':None if snap.get('ok') else LIVE_CACHE.get('error')})
-
+    snap=live_snapshot(); return jsonify({'connected':bool(snap.get('ok')),'state':LIVE_CACHE.get('state'),'source':snap.get('source'),'fetched_at':snap.get('fetched_at'),'table_date':snap.get('table_date'),'last_attempt':LIVE_CACHE.get('last_attempt'),'error':LIVE_CACHE.get('error')})
 @app.route('/api/analytics')
 def analytics():
-    n=national_summary(request.args.get('force')=='1')
-    levels=[z['current'] for z in n['zones']]
-    return jsonify({'counts':n['counts'],'avg_level':round(statistics.mean(levels),2),'max_level':max(levels),'min_level':min(levels),'rising':n['top_rising'],'closest':n['closest_to_danger']})
-
+    zones=[package_station(k) for k in STATIONS]; rising=sorted(zones,key=lambda z:z['trend_3h_cm'],reverse=True); close=sorted(zones,key=lambda z:z['current']/z['danger'],reverse=True)
+    return jsonify({'counts':{r:sum(z['risk']==r for z in zones) for r in ['NORMAL','WARNING','FLOOD','SEVERE']},'avg_level':round(statistics.mean(z['current'] for z in zones),2),'rising':rising[:6],'closest':close[:6]})
 @app.route('/api/report')
 def report():
-    n=national_summary(request.args.get('force')=='1')
-    now=datetime.now().astimezone().strftime('%d %b %Y, %I:%M:%S %p')
-    lines=["FLOODGUARD BD — FLOOD SITUATION REPORT","",f"Generated: {now}","Source: FFWC observed-water-level feed where available","","NATIONAL OVERVIEW",f"Stations monitored: {n['stations']}",f"Live stations: {n['live_stations']}",f"Normal: {n['counts']['NORMAL']}",f"Warning: {n['counts']['WARNING']}",f"Flood: {n['counts']['FLOOD']}",f"Severe: {n['counts']['SEVERE']}","","STATION STATUS"]
-    for z in n['zones']:
-        lines.append(f"{z['name']} | {z['current']:.2f} m | DL {z['danger']:.2f} m | {z['risk']} | {'FFWC LIVE' if z['live'] else 'Fallback reference'}")
+    zones=[package_station(k) for k in STATIONS]; now=datetime.now().astimezone().strftime('%d %b %Y, %I:%M:%S %p')
+    lines=['FLOODGUARD BD — FLOOD SITUATION REPORT','',f'Generated: {now}','Data states are labelled as Live, FFWC Snapshot, or Simulation.','']
+    for z in zones: lines.append(f"{z['name']} | {z['current']:.2f} m | ref {z['danger']:.2f} m | {z['risk']} | {z['status']}")
     return Response('\n'.join(lines),mimetype='text/plain',headers={'Content-Disposition':'attachment; filename="FloodGuard_BD_Situation_Report.txt"'})
 
+# --- Auth + WhatsApp notification settings. Actual delivery requires provider credentials. ---
+@app.post('/api/auth/register')
+def register():
+    data=request.get_json(force=True); email=(data.get('email') or '').strip().lower(); password=data.get('password') or ''
+    if not email or len(password)<6:return jsonify({'ok':False,'error':'Use a valid email and a password of at least 6 characters.'}),400
+    try:
+        con=db(); cur=con.execute('INSERT INTO users(email,password_hash,zone,language,whatsapp,alerts) VALUES(?,?,?,?,?,0)',(email,generate_password_hash(password),'mymensingh','en','')); con.commit(); uid=cur.lastrowid; con.close(); session['uid']=uid
+        return jsonify({'ok':True,'user':{'email':email,'zone':'mymensingh','language':'en','whatsapp':'','alerts':False}})
+    except sqlite3.IntegrityError:return jsonify({'ok':False,'error':'Account already exists.'}),409
+@app.post('/api/auth/login')
+def login():
+    data=request.get_json(force=True); email=(data.get('email') or '').strip().lower(); password=data.get('password') or ''
+    con=db(); row=con.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone(); con.close()
+    if not row or not check_password_hash(row['password_hash'],password):return jsonify({'ok':False,'error':'Invalid email or password.'}),401
+    session['uid']=row['id']; return jsonify({'ok':True,'user':dict_user(row)})
+def dict_user(row): return {'email':row['email'],'zone':row['zone'],'language':row['language'],'whatsapp':row['whatsapp'],'alerts':bool(row['alerts'])}
+@app.post('/api/auth/logout')
+def logout(): session.clear(); return jsonify({'ok':True})
+@app.get('/api/auth/me')
+def me():
+    uid=session.get('uid');
+    if not uid:return jsonify({'logged_in':False})
+    con=db(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close()
+    return jsonify({'logged_in':bool(row),'user':dict_user(row) if row else None})
+@app.post('/api/profile')
+def profile():
+    uid=session.get('uid');
+    if not uid:return jsonify({'ok':False,'error':'Login required.'}),401
+    data=request.get_json(force=True); zone=data.get('zone') if data.get('zone') in STATIONS else 'mymensingh'; lang=data.get('language') if data.get('language') in {'en','bn'} else 'en'; wa=(data.get('whatsapp') or '').strip(); alerts=1 if data.get('alerts') else 0
+    con=db(); con.execute('UPDATE users SET zone=?,language=?,whatsapp=?,alerts=? WHERE id=?',(zone,lang,wa,alerts,uid)); con.commit(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close(); return jsonify({'ok':True,'user':dict_user(row),'whatsapp_configured':bool(os.environ.get('TWILIO_ACCOUNT_SID') and os.environ.get('TWILIO_AUTH_TOKEN') and os.environ.get('TWILIO_WHATSAPP_FROM'))})
+
 if __name__=='__main__':
-    trigger_live_refresh(force=False)
-    import os
-    port = int(os.environ.get('PORT', '10000'))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    trigger_live_refresh(False)
+    port=int(os.environ.get('PORT','5081')); app.run(host='0.0.0.0',port=port,debug=False)
