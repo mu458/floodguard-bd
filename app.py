@@ -1,7 +1,7 @@
 from flask import Flask, render_template, jsonify, request, Response, session, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, timezone
-import math, random, threading, time, statistics, os, sqlite3, re
+import math, random, threading, time, statistics, os, sqlite3, re, smtplib, urllib.parse
 from live_data import fetch_ffwc_current
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -62,10 +62,131 @@ def db():
 
 def init_db():
     con = db()
-    con.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, zone TEXT, language TEXT DEFAULT "en", whatsapp TEXT, alerts INTEGER DEFAULT 0)')
+    con.execute('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, zone TEXT, language TEXT DEFAULT "en", whatsapp TEXT, alerts INTEGER DEFAULT 0, email_alerts INTEGER DEFAULT 1, whatsapp_alerts INTEGER DEFAULT 1)')
+    # Backward-compatible columns for existing databases
+    cols={r[1] for r in con.execute('PRAGMA table_info(users)').fetchall()}
+    if 'email_alerts' not in cols: con.execute('ALTER TABLE users ADD COLUMN email_alerts INTEGER DEFAULT 1')
+    if 'whatsapp_alerts' not in cols: con.execute('ALTER TABLE users ADD COLUMN whatsapp_alerts INTEGER DEFAULT 1')
+    con.execute('CREATE TABLE IF NOT EXISTS alert_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, event_type TEXT NOT NULL, event_key TEXT NOT NULL, sent_at TEXT NOT NULL, UNIQUE(user_id,event_type,event_key))')
     con.commit(); con.close()
 
 init_db()
+
+# ---------- Notification engine ----------
+def _resend_configured():
+    return bool(os.environ.get('RESEND_API_KEY'))
+
+def _email_sender():
+    return os.environ.get('RESEND_FROM_EMAIL', 'onboarding@resend.dev')
+
+def _smtp_configured():
+    return bool(os.environ.get('SMTP_HOST') and os.environ.get('SMTP_USER') and os.environ.get('SMTP_PASS') and os.environ.get('EMAIL_FROM'))
+
+def _twilio_configured():
+    return bool(os.environ.get('TWILIO_ACCOUNT_SID') and os.environ.get('TWILIO_AUTH_TOKEN') and os.environ.get('TWILIO_WHATSAPP_FROM'))
+
+def _send_email(to_email, subject, body):
+    # Primary: Resend API (uses RESEND_API_KEY set in Render Environment Variables).
+    if _resend_configured():
+        try:
+            import requests
+            r=requests.post(
+                'https://api.resend.com/emails',
+                headers={'Authorization': f"Bearer {os.environ['RESEND_API_KEY']}", 'Content-Type':'application/json'},
+                json={'from': _email_sender(), 'to':[to_email], 'subject':subject, 'text':body},
+                timeout=15,
+            )
+            if 200 <= r.status_code < 300:
+                return True, 'sent'
+            return False, f"Resend HTTP {r.status_code}: {r.text[:300]}"
+        except Exception as exc:
+            return False, str(exc)
+    # Optional fallback for self-hosted deployments.
+    if not _smtp_configured(): return False, 'Email provider is not configured.'
+    host=os.environ.get('SMTP_HOST'); port=int(os.environ.get('SMTP_PORT','587')); user=os.environ.get('SMTP_USER'); pw=os.environ.get('SMTP_PASS'); sender=os.environ.get('EMAIL_FROM')
+    msg=f"From: {sender}\r\nTo: {to_email}\r\nSubject: {subject}\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{body}"
+    try:
+        with smtplib.SMTP(host,port,timeout=15) as server:
+            server.starttls(); server.login(user,pw); server.sendmail(sender,[to_email],msg.encode('utf-8'))
+        return True, 'sent'
+    except Exception as exc:
+        return False, str(exc)
+
+def _send_whatsapp(number, body):
+    if not _twilio_configured(): return False, 'WhatsApp provider is not configured.'
+    try:
+        import requests
+        sid=os.environ['TWILIO_ACCOUNT_SID']; token=os.environ['TWILIO_AUTH_TOKEN']; sender=os.environ['TWILIO_WHATSAPP_FROM']
+        to=number if number.startswith('whatsapp:') else 'whatsapp:'+number
+        url=f'https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json'
+        r=requests.post(url, data={'From':sender,'To':to,'Body':body}, auth=(sid,token), timeout=15)
+        return (200 <= r.status_code < 300), (r.text[:300] if r.status_code>=300 else 'sent')
+    except Exception as exc:
+        return False, str(exc)
+
+def _user_event_sent(user_id,event_type,event_key):
+    con=db(); row=con.execute('SELECT 1 FROM alert_events WHERE user_id=? AND event_type=? AND event_key=?',(user_id,event_type,event_key)).fetchone(); con.close(); return bool(row)
+
+def _mark_event(user_id,event_type,event_key):
+    con=db(); con.execute('INSERT OR IGNORE INTO alert_events(user_id,event_type,event_key,sent_at) VALUES(?,?,?,?)',(user_id,event_type,event_key,datetime.now(timezone.utc).isoformat())); con.commit(); con.close()
+
+def _message_for(z,lang,kind):
+    risk=z['risk']; district=z['district']; current=z['current']; danger=z['danger']; trend=z['trend_3h_cm']; predicted=z['predicted']
+    direction='rising' if trend>0.2 else ('falling' if trend<-0.2 else 'stable')
+    if lang=='bn':
+        if kind=='welcome': return f"FloodGuard BD\nআপনার {district} zone alert subscription চালু হয়েছে। বর্তমান ঝুঁকি: {risk_label_bn(risk)}।"
+        if kind=='daily': return f"FloodGuard BD — দৈনিক আপডেট\n{district}: পানির স্তর {current:.2f} মি; গত ৩ ঘণ্টায় {'বাড়ছে' if direction=='rising' else 'কমছে' if direction=='falling' else 'প্রায় স্থির'}। ঝুঁকি: {risk_label_bn(risk)}। আগামী ২৪ ঘণ্টার পূর্বাভাস: {predicted:.2f} মি।"
+        return f"FloodGuard BD সতর্কতা\n{district}-এ বন্যার ঝুঁকি {risk_label_bn(risk)} পর্যায়ে পরিবর্তিত হয়েছে। বর্তমান পানি {current:.2f} মি; বিপদসীমা {danger:.2f} মি। স্থানীয় কর্তৃপক্ষের নির্দেশনা অনুসরণ করুন।"
+    else:
+        if kind=='welcome': return f"FloodGuard BD\nYour {district} zone alerts are now enabled. Current risk: {risk}."
+        if kind=='daily': return f"FloodGuard BD — Daily update\n{district}: water level {current:.2f} m; {direction} over the last 3 hours. Risk: {risk}. Next-24h estimate: {predicted:.2f} m."
+        return f"FloodGuard BD alert\nFlood risk in {district} has changed to {risk}. Current water level: {current:.2f} m; danger reference: {danger:.2f} m. Follow local-authority guidance."
+
+def risk_label_bn(r):
+    return {'NORMAL':'স্বাভাবিক','WARNING':'সতর্কতা','FLOOD':'বন্যার ঝুঁকি','SEVERE':'তীব্র ঝুঁকি'}.get(r,r)
+
+def _dispatch_user_event(row, event_type, event_key, kind, z):
+    if _user_event_sent(row['id'],event_type,event_key): return {'sent':False,'skipped':'already_sent'}
+    subject=f"FloodGuard BD — {z['district']} {z['risk']} alert"
+    body=_message_for(z,row['language'] or 'en',kind)
+    sent=False; details=[]
+    if row['email_alerts'] and row['alerts']:
+        ok,detail=_send_email(row['email'],subject,body); details.append('email:'+('sent' if ok else detail)); sent=sent or ok
+    if row['whatsapp_alerts'] and row['alerts'] and row['whatsapp']:
+        ok,detail=_send_whatsapp(row['whatsapp'],body); details.append('whatsapp:'+('sent' if ok else detail)); sent=sent or ok
+    if sent: _mark_event(row['id'],event_type,event_key)
+    return {'sent':sent,'details':details}
+
+def dispatch_alerts():
+    now=datetime.now(timezone.utc); today=now.strftime('%Y-%m-%d')
+    con=db(); users=con.execute('SELECT * FROM users WHERE alerts=1').fetchall(); con.close()
+    results=[]
+    for row in users:
+        try:
+            z=package_station(row['zone'] if row['zone'] in STATIONS else 'mymensingh')
+            # one-time welcome on first alert-enabled account
+            results.append(_dispatch_user_event(row,'welcome','v1','welcome',z))
+            # daily digest
+            results.append(_dispatch_user_event(row,'daily',today,'daily',z))
+            # situation-change event keyed to current risk + date to avoid repeated spam
+            event_key=f"{today}:{z['risk']}"
+            results.append(_dispatch_user_event(row,'risk_change',event_key,'change',z))
+        except Exception as exc: results.append({'sent':False,'error':str(exc)})
+    return results
+
+_ALERT_THREAD_STARTED=False
+def _alert_loop():
+    while True:
+        try: dispatch_alerts()
+        except Exception: pass
+        time.sleep(int(os.environ.get('ALERT_CHECK_SECONDS','300')))
+
+def start_alert_loop():
+    global _ALERT_THREAD_STARTED
+    if _ALERT_THREAD_STARTED: return
+    _ALERT_THREAD_STARTED=True
+    threading.Thread(target=_alert_loop,daemon=True,name='floodguard-alerts').start()
+
 
 def _live_worker():
     global _worker_running
@@ -249,7 +370,7 @@ def register():
     data=request.get_json(force=True); email=(data.get('email') or '').strip().lower(); password=data.get('password') or ''
     if not email or len(password)<6:return jsonify({'ok':False,'error':'Use a valid email and a password of at least 6 characters.'}),400
     try:
-        con=db(); cur=con.execute('INSERT INTO users(email,password_hash,zone,language,whatsapp,alerts) VALUES(?,?,?,?,?,0)',(email,generate_password_hash(password),'mymensingh','en','')); con.commit(); uid=cur.lastrowid; con.close(); session['uid']=uid
+        con=db(); cur=con.execute('INSERT INTO users(email,password_hash,zone,language,whatsapp,alerts,email_alerts,whatsapp_alerts) VALUES(?,?,?,?,?,0,1,1)',(email,generate_password_hash(password),'mymensingh','en','')); con.commit(); uid=cur.lastrowid; con.close(); session['uid']=uid
         return jsonify({'ok':True,'user':{'email':email,'zone':'mymensingh','language':'en','whatsapp':'','alerts':False}})
     except sqlite3.IntegrityError:return jsonify({'ok':False,'error':'Account already exists.'}),409
 @app.post('/api/auth/login')
@@ -258,7 +379,14 @@ def login():
     con=db(); row=con.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone(); con.close()
     if not row or not check_password_hash(row['password_hash'],password):return jsonify({'ok':False,'error':'Invalid email or password.'}),401
     session['uid']=row['id']; return jsonify({'ok':True,'user':dict_user(row)})
-def dict_user(row): return {'email':row['email'],'zone':row['zone'],'language':row['language'],'whatsapp':row['whatsapp'],'alerts':bool(row['alerts'])}
+def dict_user(row): return {'email':row['email'],'zone':row['zone'],'language':row['language'],'whatsapp':row['whatsapp'],'alerts':bool(row['alerts']),'email_alerts':bool(row['email_alerts']),'whatsapp_alerts':bool(row['whatsapp_alerts'])}
+
+def _send_welcome_once(uid, row):
+    try:
+        z=package_station(row['zone'] if row['zone'] in STATIONS else 'mymensingh')
+        return _dispatch_user_event(row,'welcome','v2','welcome',z)
+    except Exception as exc:
+        return {'sent':False,'error':str(exc)}
 @app.post('/api/auth/logout')
 def logout(): session.clear(); return jsonify({'ok':True})
 @app.get('/api/auth/me')
@@ -271,9 +399,35 @@ def me():
 def profile():
     uid=session.get('uid');
     if not uid:return jsonify({'ok':False,'error':'Login required.'}),401
-    data=request.get_json(force=True); zone=data.get('zone') if data.get('zone') in STATIONS else 'mymensingh'; lang=data.get('language') if data.get('language') in {'en','bn'} else 'en'; wa=(data.get('whatsapp') or '').strip(); alerts=1 if data.get('alerts') else 0
-    con=db(); con.execute('UPDATE users SET zone=?,language=?,whatsapp=?,alerts=? WHERE id=?',(zone,lang,wa,alerts,uid)); con.commit(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close(); return jsonify({'ok':True,'user':dict_user(row),'whatsapp_configured':bool(os.environ.get('TWILIO_ACCOUNT_SID') and os.environ.get('TWILIO_AUTH_TOKEN') and os.environ.get('TWILIO_WHATSAPP_FROM'))})
+    data=request.get_json(force=True); zone=data.get('zone') if data.get('zone') in STATIONS else 'mymensingh'; lang=data.get('language') if data.get('language') in {'en','bn'} else 'en'; wa=(data.get('whatsapp') or '').strip(); alerts=1 if data.get('alerts') else 0; email_alerts=1 if data.get('email_alerts',True) else 0; whatsapp_alerts=1 if data.get('whatsapp_alerts',True) else 0
+    con=db(); con.execute('UPDATE users SET zone=?,language=?,whatsapp=?,alerts=?,email_alerts=?,whatsapp_alerts=? WHERE id=?',(zone,lang,wa,alerts,email_alerts,whatsapp_alerts,uid)); con.commit(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close()
+    welcome_result=_send_welcome_once(uid,row) if alerts else {'sent':False,'skipped':'alerts_disabled'}
+    return jsonify({'ok':True,'user':dict_user(row),'email_configured':(_resend_configured() or _smtp_configured()),'whatsapp_configured':_twilio_configured(),'welcome':welcome_result})
+
+@app.post('/api/alerts/test-email')
+def alerts_test_email():
+    uid=session.get('uid')
+    if not uid: return jsonify({'ok':False,'error':'Login required.'}),401
+    con=db(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close()
+    if not row: return jsonify({'ok':False,'error':'Account not found.'}),404
+    z=package_station(row['zone'] if row['zone'] in STATIONS else 'mymensingh')
+    subject=f"FloodGuard BD — Test alert for {z['district']}"
+    body=_message_for(z,row['language'] or 'en','welcome')
+    ok,detail=_send_email(row['email'],subject,body)
+    return jsonify({'ok':ok,'detail':detail,'email_configured':(_resend_configured() or _smtp_configured()),'from':_email_sender()})
+
+@app.post('/api/alerts/dispatch')
+def alerts_dispatch():
+    # Manual/cron-safe trigger for notification processing.
+    return jsonify({'ok':True,'results':dispatch_alerts()})
+
+
+# Start the background alert worker in both local Flask and Gunicorn/Render.
+try:
+    trigger_live_refresh(False)
+    start_alert_loop()
+except Exception:
+    pass
 
 if __name__=='__main__':
-    trigger_live_refresh(False)
     port=int(os.environ.get('PORT','5081')); app.run(host='0.0.0.0',port=port,debug=False)
