@@ -391,6 +391,45 @@ def live_status():
 def analytics():
     zones=[package_station(k) for k in STATIONS]; rising=sorted(zones,key=lambda z:z['trend_3h_cm'],reverse=True); close=sorted(zones,key=lambda z:z['current']/z['danger'],reverse=True)
     return jsonify({'counts':{r:sum(z['risk']==r for z in zones) for r in ['NORMAL','WARNING','FLOOD','SEVERE']},'avg_level':round(statistics.mean(z['current'] for z in zones),2),'rising':rising[:6],'closest':close[:6]})
+
+@app.get('/api/hazards/earthquakes')
+def earthquakes():
+    """Recent earthquake monitoring near Bangladesh using the public USGS GeoJSON feed.
+    Monitoring only; no earthquake prediction is performed.
+    """
+    import math
+    try:
+        import requests
+        from datetime import timedelta
+        days=max(1,min(int(request.args.get('days','7')),30))
+        minmag=float(request.args.get('minmagnitude','2.5'))
+        end=datetime.now(timezone.utc)
+        start=end-timedelta(days=days)
+        url='https://earthquake.usgs.gov/fdsnws/event/1/query'
+        params={'format':'geojson','starttime':start.isoformat(),'endtime':end.isoformat(),'minmagnitude':minmag,'latitude':23.685,'longitude':90.356,'maxradiuskm':900,'limit':200,'orderby':'time'}
+        r=requests.get(url,params=params,timeout=12,headers={'User-Agent':'FloodGuard-BD/1.0'})
+        r.raise_for_status(); data=r.json()
+        def hav(lat1,lon1,lat2,lon2):
+            R=6371.0; p1=math.radians(lat1); p2=math.radians(lat2); dp=math.radians(lat2-lat1); dl=math.radians(lon2-lon1)
+            h=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+            return R*2*math.atan2(math.sqrt(h),math.sqrt(max(0,1-h)))
+        ev=[]
+        for f in data.get('features',[]):
+            p=f.get('properties') or {}; coords=(f.get('geometry') or {}).get('coordinates') or []
+            if len(coords)<3: continue
+            lon,lat,depth=coords[0],coords[1],coords[2]
+            mag=p.get('mag')
+            if lat is None or lon is None or mag is None: continue
+            dist=hav(23.685,90.356,float(lat),float(lon))
+            ts=p.get('time')
+            try: local=datetime.fromtimestamp(ts/1000,tz=timezone.utc).astimezone().strftime('%d %b %Y, %I:%M %p')
+            except Exception: local='Unknown time'
+            ev.append({'id':f.get('id'),'place':p.get('place') or 'Unknown location','magnitude':float(mag),'depth_km':float(depth or 0),'distance_km':float(dist),'local_time':local,'time_ms':ts,'url':p.get('url')})
+        ev.sort(key=lambda x:x.get('time_ms') or 0,reverse=True)
+        return jsonify({'ok':True,'count':len(ev),'max_magnitude':max((x['magnitude'] for x in ev),default=None),'nearest_km':min((x['distance_km'] for x in ev),default=None),'center':{'lat':23.685,'lon':90.356},'source':'USGS','source_url':'https://earthquake.usgs.gov/earthquakes/feed/','events':ev})
+    except Exception as e:
+        return jsonify({'ok':False,'error':str(e),'source':'USGS','source_url':'https://earthquake.usgs.gov/earthquakes/feed/','events':[]}),502
+
 @app.route('/api/report')
 def report():
     zones=[package_station(k) for k in STATIONS]; now=datetime.now().astimezone().strftime('%d %b %Y, %I:%M:%S %p')
