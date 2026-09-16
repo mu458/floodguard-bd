@@ -6,7 +6,7 @@ from live_data import fetch_ffwc_current
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE, 'floodguard.db')
-app = Flask(__name__, template_folder='templates', static_folder='static')
+app = Flask(__name__, template_folder='.', static_folder='static')
 app.secret_key = os.environ.get('SECRET_KEY', 'floodguard-dev-secret-change-me')
 
 # User-provided Mymensingh readings retained as historical project observations.
