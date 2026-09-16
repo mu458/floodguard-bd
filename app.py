@@ -430,6 +430,111 @@ def earthquakes():
     except Exception as e:
         return jsonify({'ok':False,'error':str(e),'source':'USGS','source_url':'https://earthquake.usgs.gov/earthquakes/feed/','events':[]}),502
 
+
+
+# ---------- Multi-hazard data ----------
+WEATHER_CACHE = {}
+WEATHER_CACHE_SECONDS = 180
+
+def _weather_cache_get(key):
+    item = WEATHER_CACHE.get(key)
+    if item and time.time() - item.get('ts', 0) < WEATHER_CACHE_SECONDS:
+        return item.get('data')
+    return None
+
+def _weather_cache_set(key, data):
+    WEATHER_CACHE[key] = {'ts': time.time(), 'data': data}
+    return data
+
+def _wmo_label(code):
+    labels = {0:'Clear',1:'Mainly clear',2:'Partly cloudy',3:'Overcast',45:'Fog',48:'Depositing rime fog',
+              51:'Light drizzle',53:'Drizzle',55:'Dense drizzle',56:'Freezing drizzle',57:'Freezing drizzle',
+              61:'Light rain',63:'Rain',65:'Heavy rain',66:'Freezing rain',67:'Heavy freezing rain',
+              71:'Light snow',73:'Snow',75:'Heavy snow',77:'Snow grains',80:'Rain showers',81:'Rain showers',
+              82:'Heavy rain showers',85:'Snow showers',86:'Heavy snow showers',95:'Thunderstorm',96:'Thunderstorm with hail',99:'Thunderstorm with heavy hail'}
+    return labels.get(int(code),'Weather') if code is not None else 'Weather unavailable'
+
+def _weather_hazard_score(current, daily, hourly):
+    max_wind = max(daily.get('wind_gusts_10m_max') or [0]) if daily.get('wind_gusts_10m_max') else 0
+    max_rain = max(daily.get('precipitation_probability_max') or [0]) if daily.get('precipitation_probability_max') else 0
+    max_temp = max(daily.get('temperature_2m_max') or [0]) if daily.get('temperature_2m_max') else 0
+    thunder = sum(1 for c in (hourly.get('weather_code') or []) if c is not None and int(c) >= 95)
+    rain_sum = max(daily.get('precipitation_sum') or [0]) if daily.get('precipitation_sum') else 0
+    severe = []
+    if max_wind >= 55: severe.append(('Wind alert','Strong gust potential'))
+    elif max_wind >= 40: severe.append(('Wind watch','Gusty conditions possible'))
+    if max_rain >= 80 or rain_sum >= 50: severe.append(('Heavy rain watch','High rainfall potential'))
+    elif max_rain >= 60 or rain_sum >= 25: severe.append(('Rain watch','Rainfall potential elevated'))
+    if thunder >= 1: severe.append(('Thunderstorm watch',f'{thunder} forecast thunderstorm hour(s) in the next 5 days'))
+    if max_temp >= 38: severe.append(('Heat watch','High temperature outlook'))
+    elif max_temp >= 36: severe.append(('Heat watch','Hot conditions possible'))
+    return {'wind_gust_max_kmh':max_wind,'rain_probability_max_pct':max_rain,'rain_sum_max_mm':rain_sum,'thunderstorm_hours':thunder,'max_temp_c':max_temp,'flags':severe}
+
+@app.get('/api/hazards/weather')
+def weather():
+    try:
+        zone_key = request.args.get('station','mymensingh')
+        z = STATIONS.get(zone_key, STATIONS['mymensingh'])
+        lat, lon = z['lat'], z['lon']
+        cache_key = f'{zone_key}:{round(float(lat),3)}:{round(float(lon),3)}'
+        cached = _weather_cache_get(cache_key)
+        if cached: return jsonify(cached)
+        import requests
+        params = {
+            'latitude':lat,'longitude':lon,'current':'temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,wind_gusts_10m,pressure_msl',
+            'hourly':'temperature_2m,precipitation_probability,precipitation,weather_code,wind_speed_10m,wind_gusts_10m',
+            'daily':'weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,wind_gusts_10m_max',
+            'forecast_days':5,'timezone':'Asia/Dhaka'
+        }
+        r=requests.get('https://api.open-meteo.com/v1/forecast',params=params,timeout=8,headers={'User-Agent':'FloodGuard-BD/1.0'}); r.raise_for_status(); d=r.json()
+        out={'ok':True,'zone':z['district'],'coordinates':{'lat':lat,'lon':lon},'current':d.get('current',{}),'daily':d.get('daily',{}),'hourly':d.get('hourly',{}),'hazard':_weather_hazard_score(d.get('current',{}),d.get('daily',{}),d.get('hourly',{})),'source':'Open-Meteo'}
+        out['current']['label']=_wmo_label(out['current'].get('weather_code'))
+        return jsonify(_weather_cache_set(cache_key,out))
+    except Exception as e:
+        return jsonify({'ok':False,'error':str(e),'source':'Open-Meteo'}),502
+
+@app.get('/api/hazards/cyclones')
+def cyclones():
+    """In-site tropical-cyclone watch using GDACS API. Does not predict cyclones."""
+    try:
+        import requests, math, xml.etree.ElementTree as ET
+        from datetime import timedelta
+        end=datetime.now(timezone.utc); start=end-timedelta(days=14)
+        url='https://www.gdacs.org/gdacsapi/api/Events/geteventlist/SEARCH'
+        params={'eventlist':'TC','fromdate':start.strftime('%Y-%m-%d'),'todate':end.strftime('%Y-%m-%d'),'alertlevel':'green;orange;red'}
+        r=requests.get(url,params=params,timeout=10,headers={'User-Agent':'FloodGuard-BD/1.0'}); r.raise_for_status()
+        raw=r.text
+        events=[]
+        try:
+            payload=r.json()
+            if isinstance(payload,dict):
+                raw_items=payload.get('features') or payload.get('events') or payload.get('data') or []
+                for it in raw_items:
+                    pr=it.get('properties',it) if isinstance(it,dict) else {}
+                    geom=(it.get('geometry') or {}).get('coordinates') if isinstance(it,dict) else None
+                    ev={'name':pr.get('eventname') or pr.get('name') or pr.get('eventName') or 'Tropical cyclone', 'alert':str(pr.get('alertlevel') or pr.get('alertLevel') or 'information').upper(), 'lat':None,'lon':None,'wind_kmh':pr.get('maxwind') or pr.get('maxWind') or pr.get('windSpeed')}
+                    if geom and len(geom)>=2: ev.update({'lon':float(geom[0]),'lat':float(geom[1])})
+                    if ev['lat'] is not None and ev['lon'] is not None: events.append(ev)
+        except Exception:
+            pass
+        # A resilient XML fallback for common GDACS feed structures.
+        if not events:
+            try:
+                root=ET.fromstring(raw)
+                for item in root.iter():
+                    tag=item.tag.lower()
+                    if tag.endswith('item'):
+                        txt={c.tag.lower().split('}')[-1]: (c.text or '').strip() for c in item}
+                        name=txt.get('eventname') or txt.get('title') or txt.get('name')
+                        if name: events.append({'name':name,'alert':(txt.get('alertlevel') or 'information').upper(),'lat':None,'lon':None,'wind_kmh':None})
+            except Exception:
+                pass
+        # Keep the UI useful even when GDACS returns no structured event records.
+        events=events[:10]
+        return jsonify({'ok':True,'active_count':len(events),'events':events,'source':'GDACS'})
+    except Exception as e:
+        return jsonify({'ok':False,'error':str(e),'source':'GDACS','active_count':0,'events':[]}),502
+
 @app.route('/api/report')
 def report():
     zones=[package_station(k) for k in STATIONS]; now=datetime.now().astimezone().strftime('%d %b %Y, %I:%M:%S %p')
