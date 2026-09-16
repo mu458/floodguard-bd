@@ -53,7 +53,6 @@ FFWC_BULLETIN_SNAPSHOT = {
 
 LIVE_CACHE = {'payload': None, 'expires': 0, 'error': None, 'state': 'idle', 'last_attempt': None}
 CACHE_SECONDS = int(os.environ.get('LIVE_REFRESH_SECONDS', '300'))
-ALERT_CHECK_SECONDS = int(os.environ.get('ALERT_CHECK_SECONDS', '60'))
 _cache_lock = threading.Lock(); _worker_lock = threading.Lock(); _worker_running = False
 
 def db():
@@ -171,20 +170,6 @@ def _dispatch_user_event(row, event_type, event_key, kind, z):
     if sent: _mark_event(row['id'],event_type,event_key)
     return {'sent':sent,'details':details}
 
-
-def _send_welcome_now(row,z):
-    """Send welcome notification immediately; do not use global event de-duplication."""
-    subject=f"FloodGuard BD — Welcome / {z['district']}"
-    body=_message_for(z,row['language'] or 'en','welcome')
-    sent=False; details=[]
-    if row['email_alerts'] and row['alerts']:
-        ok,detail=_send_email(row['email'],subject,body)
-        details.append('email:'+('sent' if ok else detail)); sent=sent or ok
-    if row['whatsapp_alerts'] and row['alerts'] and row['whatsapp']:
-        ok,detail=_send_whatsapp(row['whatsapp'],body)
-        details.append('whatsapp:'+('sent' if ok else detail)); sent=sent or ok
-    return {'sent':sent,'details':details}
-
 def dispatch_alerts():
     now=datetime.now(timezone.utc); today=now.strftime('%Y-%m-%d')
     con=db(); users=con.execute('SELECT * FROM users WHERE alerts=1').fetchall(); con.close(); results=[]
@@ -192,20 +177,19 @@ def dispatch_alerts():
         try:
             z=package_station(row['zone'] if row['zone'] in STATIONS else 'mymensingh')
             state=_get_alert_state(row['id'])
-            # First run after enabling alerts: retry welcome until it succeeds.
+            # First run after enabling alerts: welcome + initialize state.
             if not state or not state['welcome_sent']:
                 r=_dispatch_user_event(row,'welcome','v1','welcome',z); results.append(r)
-                if r.get('sent') or not (row['email_alerts'] or row['whatsapp_alerts']):
-                    _set_alert_state(row['id'],welcome_sent=1,last_risk=z['risk'],last_daily_date=today if r.get('sent') else None)
-                state=_get_alert_state(row['id'])
+                if r.get('sent') or not (row['email_alerts'] or row['whatsapp_alerts']): _set_alert_state(row['id'],welcome_sent=1,last_risk=z['risk'])
             else:
-                # Notify on every risk-category transition, upward or downward.
+                # Notify only when risk actually changes.
                 if state['last_risk'] and state['last_risk'] != z['risk']:
                     r=_dispatch_user_event(row,'risk_change',f"{state['last_risk']}->{z['risk']}",'change',z); results.append(r)
                     if r.get('sent'): _set_alert_state(row['id'],last_risk=z['risk'])
                 elif not state['last_risk']:
                     _set_alert_state(row['id'],last_risk=z['risk'])
-                state=_get_alert_state(row['id'])
+            state=_get_alert_state(row['id'])
+            if not state or state['last_risk'] == z['risk']:
                 if not state or state['last_daily_date'] != today:
                     r=_dispatch_user_event(row,'daily',today,'daily',z); results.append(r)
                     if r.get('sent'): _set_alert_state(row['id'],last_daily_date=today,last_risk=z['risk'])
@@ -216,7 +200,7 @@ def _alert_loop():
     while True:
         try: dispatch_alerts()
         except Exception: pass
-        time.sleep(ALERT_CHECK_SECONDS)
+        time.sleep(int(os.environ.get('ALERT_CHECK_SECONDS','300')))
 
 def start_alert_loop():
     global _ALERT_THREAD_STARTED
@@ -436,20 +420,7 @@ def profile():
     uid=session.get('uid');
     if not uid:return jsonify({'ok':False,'error':'Login required.'}),401
     data=request.get_json(force=True); zone=data.get('zone') if data.get('zone') in STATIONS else 'mymensingh'; lang=data.get('language') if data.get('language') in {'en','bn'} else 'en'; wa=(data.get('whatsapp') or '').strip(); alerts=1 if data.get('alerts') else 0; email_alerts=1 if data.get('email_alerts',True) else 0; whatsapp_alerts=1 if data.get('whatsapp_alerts',True) else 0
-    con=db(); before=con.execute('SELECT alerts FROM users WHERE id=?',(uid,)).fetchone(); was_enabled=bool(before and before['alerts']); con.execute('UPDATE users SET zone=?,language=?,whatsapp=?,alerts=?,email_alerts=?,whatsapp_alerts=? WHERE id=?',(zone,lang,wa,alerts,email_alerts,whatsapp_alerts,uid)); con.commit(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close()
-    # Send the welcome notification immediately when alerts are newly enabled.
-    welcome=None
-    if alerts and not was_enabled:
-        z=package_station(zone)
-        # Reset the welcome state and send a fresh welcome message for this enable action.
-        # Welcome is stateful rather than event-key deduped so it works on every re-enable.
-        _set_alert_state(uid,last_risk=z['risk'],welcome_sent=0,last_daily_date=None)
-        welcome=_send_welcome_now(row,z)
-        if welcome.get('sent'):
-            _set_alert_state(uid,welcome_sent=1,last_risk=z['risk'],last_daily_date=datetime.now(timezone.utc).strftime('%Y-%m-%d'))
-    elif not alerts:
-        _set_alert_state(uid,last_daily_date=None,welcome_sent=1)
-    return jsonify({'ok':True,'user':dict_user(row),'email_configured':_email_configured(),'whatsapp_configured':_twilio_configured(),'welcome':welcome})
+    con=db(); con.execute('UPDATE users SET zone=?,language=?,whatsapp=?,alerts=?,email_alerts=?,whatsapp_alerts=? WHERE id=?',(zone,lang,wa,alerts,email_alerts,whatsapp_alerts,uid)); con.commit(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close(); return jsonify({'ok':True,'user':dict_user(row),'email_configured':_smtp_configured(),'whatsapp_configured':_twilio_configured()})
 
 @app.post('/api/alerts/test-email')
 def test_email():
@@ -469,22 +440,9 @@ def enable_alerts():
     con=db(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close()
     if not row:return jsonify({'ok':False,'error':'Account not found.'}),404
     z=package_station(row['zone'] if row['zone'] in STATIONS else 'mymensingh')
+    now=datetime.now(timezone.utc).isoformat()
     _set_alert_state(uid,last_risk=z['risk'],welcome_sent=0,last_daily_date=None)
-    welcome=_send_welcome_now(row,z)
-    if welcome.get('sent'):
-        _set_alert_state(uid,welcome_sent=1,last_risk=z['risk'],last_daily_date=datetime.now(timezone.utc).strftime('%Y-%m-%d'))
-    return jsonify({'ok':True,'message':'Alerts enabled.','welcome':welcome})
-
-@app.post('/api/alerts/zone-update')
-def zone_update_email():
-    uid=session.get('uid')
-    if not uid:return jsonify({'ok':False,'error':'Login required.'}),401
-    con=db(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close()
-    if not row:return jsonify({'ok':False,'error':'Account not found.'}),404
-    z=package_station(row['zone'] if row['zone'] in STATIONS else 'mymensingh')
-    body=_message_for(z,row['language'] or 'en','daily')
-    ok,detail=_send_email(row['email'],f"FloodGuard BD — {z['district']} zone update",body)
-    return jsonify({'ok':ok,'detail':detail})
+    return jsonify({'ok':True,'message':'Alerts enabled. A welcome email will be sent on the next alert cycle.'})
 
 @app.post('/api/alerts/dispatch')
 def alerts_dispatch():

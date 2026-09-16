@@ -32,7 +32,3 @@ ALERT CONFIGURATION
 - Email delivery uses SMTP environment variables: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, EMAIL_FROM.
 - WhatsApp delivery uses Twilio environment variables: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM.
 - `/api/alerts/dispatch` can be called by an external cron for reliable scheduled delivery.
-
-
-## 5074 fix
-Welcome email is sent immediately when alerts are newly enabled, instead of waiting for the background alert cycle.
