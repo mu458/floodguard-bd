@@ -83,8 +83,8 @@ def _email_configured():
 def _smtp_configured():
     return bool(os.environ.get('SMTP_HOST') and os.environ.get('SMTP_USER') and os.environ.get('SMTP_PASS') and os.environ.get('EMAIL_FROM'))
 
-def _whatsapp_bridge_configured():
-    return bool(_email_script_url())
+def _twilio_configured():
+    return bool(os.environ.get('TWILIO_ACCOUNT_SID') and os.environ.get('TWILIO_AUTH_TOKEN') and os.environ.get('TWILIO_WHATSAPP_FROM'))
 
 def _send_email(to_email, subject, body):
     # Primary path: Google Apps Script -> Gmail. Optional SMTP fallback remains available.
@@ -117,22 +117,15 @@ def _send_email(to_email, subject, body):
     return False, 'Email provider is not configured.'
 
 def _send_whatsapp(number, body):
-    # WhatsApp is sent through the same Google Apps Script bridge.
-    # The script holds the WhatsApp Cloud API credentials in Script Properties.
-    url=_email_script_url()
-    if not url: return False, 'WhatsApp bridge is not configured.'
+    if not _twilio_configured(): return False, 'WhatsApp provider is not configured.'
     try:
         import requests
-        r=requests.post(url, json={'action':'send_whatsapp','to':number,'body':body}, timeout=20)
-        if 200 <= r.status_code < 300:
-            try:
-                out=r.json()
-                return bool(out.get('ok')), out.get('error') or ('sent via Google Apps Script' if out.get('ok') else 'WhatsApp send failed')
-            except Exception:
-                return True, 'sent via Google Apps Script'
-        return False, f'WhatsApp bridge HTTP {r.status_code}'
-    except Exception as exc:
-        return False, str(exc)
+        sid=os.environ['TWILIO_ACCOUNT_SID']; token=os.environ['TWILIO_AUTH_TOKEN']; sender=os.environ['TWILIO_WHATSAPP_FROM']
+        to=number if number.startswith('whatsapp:') else 'whatsapp:'+number
+        url=f'https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json'
+        r=requests.post(url, data={'From':sender,'To':to,'Body':body}, auth=(sid,token), timeout=15)
+        return (200 <= r.status_code < 300), (r.text[:300] if r.status_code>=300 else 'sent')
+    except Exception as exc: return False, str(exc)
 
 def _user_event_sent(user_id,event_type,event_key):
     con=db(); row=con.execute('SELECT 1 FROM alert_events WHERE user_id=? AND event_type=? AND event_key=?',(user_id,event_type,event_key)).fetchone(); con.close(); return bool(row)
@@ -391,150 +384,6 @@ def live_status():
 def analytics():
     zones=[package_station(k) for k in STATIONS]; rising=sorted(zones,key=lambda z:z['trend_3h_cm'],reverse=True); close=sorted(zones,key=lambda z:z['current']/z['danger'],reverse=True)
     return jsonify({'counts':{r:sum(z['risk']==r for z in zones) for r in ['NORMAL','WARNING','FLOOD','SEVERE']},'avg_level':round(statistics.mean(z['current'] for z in zones),2),'rising':rising[:6],'closest':close[:6]})
-
-@app.get('/api/hazards/earthquakes')
-def earthquakes():
-    """Recent earthquake monitoring near Bangladesh using the public USGS GeoJSON feed.
-    Monitoring only; no earthquake prediction is performed.
-    """
-    import math
-    try:
-        import requests
-        from datetime import timedelta
-        days=max(1,min(int(request.args.get('days','7')),30))
-        minmag=float(request.args.get('minmagnitude','2.5'))
-        end=datetime.now(timezone.utc)
-        start=end-timedelta(days=days)
-        url='https://earthquake.usgs.gov/fdsnws/event/1/query'
-        params={'format':'geojson','starttime':start.isoformat(),'endtime':end.isoformat(),'minmagnitude':minmag,'latitude':23.685,'longitude':90.356,'maxradiuskm':900,'limit':200,'orderby':'time'}
-        r=requests.get(url,params=params,timeout=12,headers={'User-Agent':'FloodGuard-BD/1.0'})
-        r.raise_for_status(); data=r.json()
-        def hav(lat1,lon1,lat2,lon2):
-            R=6371.0; p1=math.radians(lat1); p2=math.radians(lat2); dp=math.radians(lat2-lat1); dl=math.radians(lon2-lon1)
-            h=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
-            return R*2*math.atan2(math.sqrt(h),math.sqrt(max(0,1-h)))
-        ev=[]
-        for f in data.get('features',[]):
-            p=f.get('properties') or {}; coords=(f.get('geometry') or {}).get('coordinates') or []
-            if len(coords)<3: continue
-            lon,lat,depth=coords[0],coords[1],coords[2]
-            mag=p.get('mag')
-            if lat is None or lon is None or mag is None: continue
-            dist=hav(23.685,90.356,float(lat),float(lon))
-            ts=p.get('time')
-            try: local=datetime.fromtimestamp(ts/1000,tz=timezone.utc).astimezone().strftime('%d %b %Y, %I:%M %p')
-            except Exception: local='Unknown time'
-            ev.append({'id':f.get('id'),'place':p.get('place') or 'Unknown location','magnitude':float(mag),'depth_km':float(depth or 0),'distance_km':float(dist),'local_time':local,'time_ms':ts,'url':p.get('url')})
-        ev.sort(key=lambda x:x.get('time_ms') or 0,reverse=True)
-        return jsonify({'ok':True,'count':len(ev),'max_magnitude':max((x['magnitude'] for x in ev),default=None),'nearest_km':min((x['distance_km'] for x in ev),default=None),'center':{'lat':23.685,'lon':90.356},'source':'USGS','source_url':'https://earthquake.usgs.gov/earthquakes/feed/','events':ev})
-    except Exception as e:
-        return jsonify({'ok':False,'error':str(e),'source':'USGS','source_url':'https://earthquake.usgs.gov/earthquakes/feed/','events':[]}),502
-
-
-
-# ---------- Multi-hazard data ----------
-WEATHER_CACHE = {}
-WEATHER_CACHE_SECONDS = 180
-
-def _weather_cache_get(key):
-    item = WEATHER_CACHE.get(key)
-    if item and time.time() - item.get('ts', 0) < WEATHER_CACHE_SECONDS:
-        return item.get('data')
-    return None
-
-def _weather_cache_set(key, data):
-    WEATHER_CACHE[key] = {'ts': time.time(), 'data': data}
-    return data
-
-def _wmo_label(code):
-    labels = {0:'Clear',1:'Mainly clear',2:'Partly cloudy',3:'Overcast',45:'Fog',48:'Depositing rime fog',
-              51:'Light drizzle',53:'Drizzle',55:'Dense drizzle',56:'Freezing drizzle',57:'Freezing drizzle',
-              61:'Light rain',63:'Rain',65:'Heavy rain',66:'Freezing rain',67:'Heavy freezing rain',
-              71:'Light snow',73:'Snow',75:'Heavy snow',77:'Snow grains',80:'Rain showers',81:'Rain showers',
-              82:'Heavy rain showers',85:'Snow showers',86:'Heavy snow showers',95:'Thunderstorm',96:'Thunderstorm with hail',99:'Thunderstorm with heavy hail'}
-    return labels.get(int(code),'Weather') if code is not None else 'Weather unavailable'
-
-def _weather_hazard_score(current, daily, hourly):
-    max_wind = max(daily.get('wind_gusts_10m_max') or [0]) if daily.get('wind_gusts_10m_max') else 0
-    max_rain = max(daily.get('precipitation_probability_max') or [0]) if daily.get('precipitation_probability_max') else 0
-    max_temp = max(daily.get('temperature_2m_max') or [0]) if daily.get('temperature_2m_max') else 0
-    thunder = sum(1 for c in (hourly.get('weather_code') or []) if c is not None and int(c) >= 95)
-    rain_sum = max(daily.get('precipitation_sum') or [0]) if daily.get('precipitation_sum') else 0
-    severe = []
-    if max_wind >= 55: severe.append(('Wind alert','Strong gust potential'))
-    elif max_wind >= 40: severe.append(('Wind watch','Gusty conditions possible'))
-    if max_rain >= 80 or rain_sum >= 50: severe.append(('Heavy rain watch','High rainfall potential'))
-    elif max_rain >= 60 or rain_sum >= 25: severe.append(('Rain watch','Rainfall potential elevated'))
-    if thunder >= 1: severe.append(('Thunderstorm watch',f'{thunder} forecast thunderstorm hour(s) in the next 5 days'))
-    if max_temp >= 38: severe.append(('Heat watch','High temperature outlook'))
-    elif max_temp >= 36: severe.append(('Heat watch','Hot conditions possible'))
-    return {'wind_gust_max_kmh':max_wind,'rain_probability_max_pct':max_rain,'rain_sum_max_mm':rain_sum,'thunderstorm_hours':thunder,'max_temp_c':max_temp,'flags':severe}
-
-@app.get('/api/hazards/weather')
-def weather():
-    try:
-        zone_key = request.args.get('station','mymensingh')
-        z = STATIONS.get(zone_key, STATIONS['mymensingh'])
-        lat, lon = z['lat'], z['lon']
-        cache_key = f'{zone_key}:{round(float(lat),3)}:{round(float(lon),3)}'
-        cached = _weather_cache_get(cache_key)
-        if cached: return jsonify(cached)
-        import requests
-        params = {
-            'latitude':lat,'longitude':lon,'current':'temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m,wind_gusts_10m,pressure_msl',
-            'hourly':'temperature_2m,precipitation_probability,precipitation,weather_code,wind_speed_10m,wind_gusts_10m',
-            'daily':'weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,wind_gusts_10m_max',
-            'forecast_days':5,'timezone':'Asia/Dhaka'
-        }
-        r=requests.get('https://api.open-meteo.com/v1/forecast',params=params,timeout=8,headers={'User-Agent':'FloodGuard-BD/1.0'}); r.raise_for_status(); d=r.json()
-        out={'ok':True,'zone':z['district'],'coordinates':{'lat':lat,'lon':lon},'current':d.get('current',{}),'daily':d.get('daily',{}),'hourly':d.get('hourly',{}),'hazard':_weather_hazard_score(d.get('current',{}),d.get('daily',{}),d.get('hourly',{})),'source':'Open-Meteo'}
-        out['current']['label']=_wmo_label(out['current'].get('weather_code'))
-        return jsonify(_weather_cache_set(cache_key,out))
-    except Exception as e:
-        return jsonify({'ok':False,'error':str(e),'source':'Open-Meteo'}),502
-
-@app.get('/api/hazards/cyclones')
-def cyclones():
-    """In-site tropical-cyclone watch using GDACS API. Does not predict cyclones."""
-    try:
-        import requests, math, xml.etree.ElementTree as ET
-        from datetime import timedelta
-        end=datetime.now(timezone.utc); start=end-timedelta(days=14)
-        url='https://www.gdacs.org/gdacsapi/api/Events/geteventlist/SEARCH'
-        params={'eventlist':'TC','fromdate':start.strftime('%Y-%m-%d'),'todate':end.strftime('%Y-%m-%d'),'alertlevel':'green;orange;red'}
-        r=requests.get(url,params=params,timeout=10,headers={'User-Agent':'FloodGuard-BD/1.0'}); r.raise_for_status()
-        raw=r.text
-        events=[]
-        try:
-            payload=r.json()
-            if isinstance(payload,dict):
-                raw_items=payload.get('features') or payload.get('events') or payload.get('data') or []
-                for it in raw_items:
-                    pr=it.get('properties',it) if isinstance(it,dict) else {}
-                    geom=(it.get('geometry') or {}).get('coordinates') if isinstance(it,dict) else None
-                    ev={'name':pr.get('eventname') or pr.get('name') or pr.get('eventName') or 'Tropical cyclone', 'alert':str(pr.get('alertlevel') or pr.get('alertLevel') or 'information').upper(), 'lat':None,'lon':None,'wind_kmh':pr.get('maxwind') or pr.get('maxWind') or pr.get('windSpeed')}
-                    if geom and len(geom)>=2: ev.update({'lon':float(geom[0]),'lat':float(geom[1])})
-                    if ev['lat'] is not None and ev['lon'] is not None: events.append(ev)
-        except Exception:
-            pass
-        # A resilient XML fallback for common GDACS feed structures.
-        if not events:
-            try:
-                root=ET.fromstring(raw)
-                for item in root.iter():
-                    tag=item.tag.lower()
-                    if tag.endswith('item'):
-                        txt={c.tag.lower().split('}')[-1]: (c.text or '').strip() for c in item}
-                        name=txt.get('eventname') or txt.get('title') or txt.get('name')
-                        if name: events.append({'name':name,'alert':(txt.get('alertlevel') or 'information').upper(),'lat':None,'lon':None,'wind_kmh':None})
-            except Exception:
-                pass
-        # Keep the UI useful even when GDACS returns no structured event records.
-        events=events[:10]
-        return jsonify({'ok':True,'active_count':len(events),'events':events,'source':'GDACS'})
-    except Exception as e:
-        return jsonify({'ok':False,'error':str(e),'source':'GDACS','active_count':0,'events':[]}),502
-
 @app.route('/api/report')
 def report():
     zones=[package_station(k) for k in STATIONS]; now=datetime.now().astimezone().strftime('%d %b %Y, %I:%M:%S %p')
@@ -568,43 +417,10 @@ def me():
     return jsonify({'logged_in':bool(row),'user':dict_user(row) if row else None})
 @app.post('/api/profile')
 def profile():
-    uid=session.get('uid')
-    if not uid:
-        return jsonify({'ok':False,'error':'Login required.'}),401
-    data=request.get_json(force=True)
-    zone=data.get('zone') if data.get('zone') in STATIONS else 'mymensingh'
-    lang=data.get('language') if data.get('language') in {'en','bn'} else 'en'
-    wa=(data.get('whatsapp') or '').strip()
-    alerts=1 if data.get('alerts') else 0
-    email_alerts=1 if data.get('email_alerts',True) else 0
-    whatsapp_alerts=1 if data.get('whatsapp_alerts',True) else 0
-
-    con=db()
-    old=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
-    if not old:
-        con.close()
-        return jsonify({'ok':False,'error':'Account not found.'}),404
-    old_zone=old['zone'] if old['zone'] in STATIONS else 'mymensingh'
-    old_alerts=bool(old['alerts'])
-    con.execute('UPDATE users SET zone=?,language=?,whatsapp=?,alerts=?,email_alerts=?,whatsapp_alerts=? WHERE id=?',(zone,lang,wa,alerts,email_alerts,whatsapp_alerts,uid))
-    row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
-    con.commit(); con.close()
-
-    # Immediate notification events: never wait for the background polling loop.
-    immediate=[]
-    z=package_station(zone)
-    if alerts and not old_alerts:
-        # Enabling alerts is a new subscription: send welcome immediately.
-        _set_alert_state(uid,last_risk=z['risk'],welcome_sent=0,last_daily_date=None)
-        immediate.append(_dispatch_user_event(row,'welcome',f"enable-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}",'welcome',z))
-        if immediate[-1].get('sent'):
-            _set_alert_state(uid,last_risk=z['risk'],welcome_sent=1)
-    elif alerts and old_alerts and old_zone != zone:
-        # Zone change while already subscribed: send one zone-update mail immediately.
-        immediate.append(_dispatch_user_event(row,'zone_change',f'{old_zone}->{zone}','change',z))
-        _set_alert_state(uid,last_risk=z['risk'])
-
-    return jsonify({'ok':True,'user':dict_user(row),'email_configured':_email_configured(),'whatsapp_configured':_whatsapp_bridge_configured(),'immediate':immediate})
+    uid=session.get('uid');
+    if not uid:return jsonify({'ok':False,'error':'Login required.'}),401
+    data=request.get_json(force=True); zone=data.get('zone') if data.get('zone') in STATIONS else 'mymensingh'; lang=data.get('language') if data.get('language') in {'en','bn'} else 'en'; wa=(data.get('whatsapp') or '').strip(); alerts=1 if data.get('alerts') else 0; email_alerts=1 if data.get('email_alerts',True) else 0; whatsapp_alerts=1 if data.get('whatsapp_alerts',True) else 0
+    con=db(); con.execute('UPDATE users SET zone=?,language=?,whatsapp=?,alerts=?,email_alerts=?,whatsapp_alerts=? WHERE id=?',(zone,lang,wa,alerts,email_alerts,whatsapp_alerts,uid)); con.commit(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close(); return jsonify({'ok':True,'user':dict_user(row),'email_configured':_smtp_configured(),'whatsapp_configured':_twilio_configured()})
 
 @app.post('/api/alerts/test-email')
 def test_email():
@@ -624,13 +440,9 @@ def enable_alerts():
     con=db(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close()
     if not row:return jsonify({'ok':False,'error':'Account not found.'}),404
     z=package_station(row['zone'] if row['zone'] in STATIONS else 'mymensingh')
+    now=datetime.now(timezone.utc).isoformat()
     _set_alert_state(uid,last_risk=z['risk'],welcome_sent=0,last_daily_date=None)
-    fresh=con=None
-    con=db(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close()
-    result=_dispatch_user_event(row,'welcome',f"enable-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}",'welcome',z)
-    if result.get('sent'):
-        _set_alert_state(uid,last_risk=z['risk'],welcome_sent=1)
-    return jsonify({'ok':bool(result.get('sent')),'message':'Welcome alert sent immediately.' if result.get('sent') else 'Could not send welcome alert.','details':result})
+    return jsonify({'ok':True,'message':'Alerts enabled. A welcome email will be sent on the next alert cycle.'})
 
 @app.post('/api/alerts/dispatch')
 def alerts_dispatch():
