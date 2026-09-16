@@ -420,7 +420,18 @@ def profile():
     uid=session.get('uid');
     if not uid:return jsonify({'ok':False,'error':'Login required.'}),401
     data=request.get_json(force=True); zone=data.get('zone') if data.get('zone') in STATIONS else 'mymensingh'; lang=data.get('language') if data.get('language') in {'en','bn'} else 'en'; wa=(data.get('whatsapp') or '').strip(); alerts=1 if data.get('alerts') else 0; email_alerts=1 if data.get('email_alerts',True) else 0; whatsapp_alerts=1 if data.get('whatsapp_alerts',True) else 0
-    con=db(); con.execute('UPDATE users SET zone=?,language=?,whatsapp=?,alerts=?,email_alerts=?,whatsapp_alerts=? WHERE id=?',(zone,lang,wa,alerts,email_alerts,whatsapp_alerts,uid)); con.commit(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close(); return jsonify({'ok':True,'user':dict_user(row),'email_configured':_smtp_configured(),'whatsapp_configured':_twilio_configured()})
+    con=db(); before=con.execute('SELECT alerts FROM users WHERE id=?',(uid,)).fetchone(); was_enabled=bool(before and before['alerts']); con.execute('UPDATE users SET zone=?,language=?,whatsapp=?,alerts=?,email_alerts=?,whatsapp_alerts=? WHERE id=?',(zone,lang,wa,alerts,email_alerts,whatsapp_alerts,uid)); con.commit(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close()
+    # Send the welcome notification immediately when alerts are newly enabled.
+    welcome=None
+    if alerts and not was_enabled:
+        z=package_station(zone)
+        _set_alert_state(uid,last_risk=z['risk'],welcome_sent=0,last_daily_date=None)
+        welcome=_dispatch_user_event(row,'welcome','v1','welcome',z)
+        if welcome.get('sent'):
+            _set_alert_state(uid,welcome_sent=1,last_risk=z['risk'])
+    elif not alerts:
+        _set_alert_state(uid,last_daily_date=None,welcome_sent=1)
+    return jsonify({'ok':True,'user':dict_user(row),'email_configured':_email_configured(),'whatsapp_configured':_twilio_configured(),'welcome':welcome})
 
 @app.post('/api/alerts/test-email')
 def test_email():
