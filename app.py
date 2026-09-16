@@ -417,10 +417,43 @@ def me():
     return jsonify({'logged_in':bool(row),'user':dict_user(row) if row else None})
 @app.post('/api/profile')
 def profile():
-    uid=session.get('uid');
-    if not uid:return jsonify({'ok':False,'error':'Login required.'}),401
-    data=request.get_json(force=True); zone=data.get('zone') if data.get('zone') in STATIONS else 'mymensingh'; lang=data.get('language') if data.get('language') in {'en','bn'} else 'en'; wa=(data.get('whatsapp') or '').strip(); alerts=1 if data.get('alerts') else 0; email_alerts=1 if data.get('email_alerts',True) else 0; whatsapp_alerts=1 if data.get('whatsapp_alerts',True) else 0
-    con=db(); con.execute('UPDATE users SET zone=?,language=?,whatsapp=?,alerts=?,email_alerts=?,whatsapp_alerts=? WHERE id=?',(zone,lang,wa,alerts,email_alerts,whatsapp_alerts,uid)); con.commit(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close(); return jsonify({'ok':True,'user':dict_user(row),'email_configured':_smtp_configured(),'whatsapp_configured':_twilio_configured()})
+    uid=session.get('uid')
+    if not uid:
+        return jsonify({'ok':False,'error':'Login required.'}),401
+    data=request.get_json(force=True)
+    zone=data.get('zone') if data.get('zone') in STATIONS else 'mymensingh'
+    lang=data.get('language') if data.get('language') in {'en','bn'} else 'en'
+    wa=(data.get('whatsapp') or '').strip()
+    alerts=1 if data.get('alerts') else 0
+    email_alerts=1 if data.get('email_alerts',True) else 0
+    whatsapp_alerts=1 if data.get('whatsapp_alerts',True) else 0
+
+    con=db()
+    old=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
+    if not old:
+        con.close()
+        return jsonify({'ok':False,'error':'Account not found.'}),404
+    old_zone=old['zone'] if old['zone'] in STATIONS else 'mymensingh'
+    old_alerts=bool(old['alerts'])
+    con.execute('UPDATE users SET zone=?,language=?,whatsapp=?,alerts=?,email_alerts=?,whatsapp_alerts=? WHERE id=?',(zone,lang,wa,alerts,email_alerts,whatsapp_alerts,uid))
+    row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
+    con.commit(); con.close()
+
+    # Immediate notification events: never wait for the background polling loop.
+    immediate=[]
+    z=package_station(zone)
+    if alerts and not old_alerts:
+        # Enabling alerts is a new subscription: send welcome immediately.
+        _set_alert_state(uid,last_risk=z['risk'],welcome_sent=0,last_daily_date=None)
+        immediate.append(_dispatch_user_event(row,'welcome',f"enable-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}",'welcome',z))
+        if immediate[-1].get('sent'):
+            _set_alert_state(uid,last_risk=z['risk'],welcome_sent=1)
+    elif alerts and old_alerts and old_zone != zone:
+        # Zone change while already subscribed: send one zone-update mail immediately.
+        immediate.append(_dispatch_user_event(row,'zone_change',f'{old_zone}->{zone}','change',z))
+        _set_alert_state(uid,last_risk=z['risk'])
+
+    return jsonify({'ok':True,'user':dict_user(row),'email_configured':_email_configured(),'whatsapp_configured':_twilio_configured(),'immediate':immediate})
 
 @app.post('/api/alerts/test-email')
 def test_email():
@@ -440,9 +473,13 @@ def enable_alerts():
     con=db(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close()
     if not row:return jsonify({'ok':False,'error':'Account not found.'}),404
     z=package_station(row['zone'] if row['zone'] in STATIONS else 'mymensingh')
-    now=datetime.now(timezone.utc).isoformat()
     _set_alert_state(uid,last_risk=z['risk'],welcome_sent=0,last_daily_date=None)
-    return jsonify({'ok':True,'message':'Alerts enabled. A welcome email will be sent on the next alert cycle.'})
+    fresh=con=None
+    con=db(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close()
+    result=_dispatch_user_event(row,'welcome',f"enable-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}",'welcome',z)
+    if result.get('sent'):
+        _set_alert_state(uid,last_risk=z['risk'],welcome_sent=1)
+    return jsonify({'ok':bool(result.get('sent')),'message':'Welcome alert sent immediately.' if result.get('sent') else 'Could not send welcome alert.','details':result})
 
 @app.post('/api/alerts/dispatch')
 def alerts_dispatch():
