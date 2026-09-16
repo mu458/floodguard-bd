@@ -1,7 +1,7 @@
 from flask import Flask, render_template, jsonify, request, Response, session, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta, timezone
-import math, random, threading, time, statistics, os, sqlite3, re, smtplib, urllib.parse, json
+import math, random, threading, time, statistics, os, sqlite3, re, smtplib, urllib.parse
 from live_data import fetch_ffwc_current
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -68,18 +68,11 @@ def init_db():
     if 'email_alerts' not in cols: con.execute('ALTER TABLE users ADD COLUMN email_alerts INTEGER DEFAULT 1')
     if 'whatsapp_alerts' not in cols: con.execute('ALTER TABLE users ADD COLUMN whatsapp_alerts INTEGER DEFAULT 1')
     con.execute('CREATE TABLE IF NOT EXISTS alert_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, event_type TEXT NOT NULL, event_key TEXT NOT NULL, sent_at TEXT NOT NULL, UNIQUE(user_id,event_type,event_key))')
-    con.execute('CREATE TABLE IF NOT EXISTS alert_state (user_id INTEGER PRIMARY KEY, last_risk TEXT, last_daily_date TEXT, welcome_sent INTEGER DEFAULT 0, updated_at TEXT NOT NULL)')
     con.commit(); con.close()
 
 init_db()
 
 # ---------- Notification engine ----------
-def _email_script_url():
-    return os.environ.get('FLOODGUARD_EMAIL_WEBAPP_URL', '').strip() or 'https://script.google.com/macros/s/AKfycbzZUhJCgthQPXjUbVY7DgspCln2QpANsVRlmF56ShtP0k2I9s1UkRjWy1L8prw7vx8P/exec'
-
-def _email_configured():
-    return bool(_email_script_url())
-
 def _smtp_configured():
     return bool(os.environ.get('SMTP_HOST') and os.environ.get('SMTP_USER') and os.environ.get('SMTP_PASS') and os.environ.get('EMAIL_FROM'))
 
@@ -87,34 +80,15 @@ def _twilio_configured():
     return bool(os.environ.get('TWILIO_ACCOUNT_SID') and os.environ.get('TWILIO_AUTH_TOKEN') and os.environ.get('TWILIO_WHATSAPP_FROM'))
 
 def _send_email(to_email, subject, body):
-    # Primary path: Google Apps Script -> Gmail. Optional SMTP fallback remains available.
-    url=_email_script_url()
-    if url:
-        try:
-            import requests
-            r=requests.post(url, json={'action':'send_email','to':to_email,'subject':subject,'body':body}, timeout=20)
-            if 200 <= r.status_code < 300:
-                try:
-                    out=r.json()
-                    if out.get('ok'):
-                        return True, 'sent via Google Apps Script'
-                    return False, out.get('error','Google Apps Script rejected email')
-                except Exception:
-                    return True, 'sent via Google Apps Script'
-            return False, f'Email bridge HTTP {r.status_code}'
-        except Exception as exc:
-            if not _smtp_configured():
-                return False, f'Email bridge error: {exc}'
-    if _smtp_configured():
-        host=os.environ.get('SMTP_HOST'); port=int(os.environ.get('SMTP_PORT','587')); user=os.environ.get('SMTP_USER'); pw=os.environ.get('SMTP_PASS'); sender=os.environ.get('EMAIL_FROM')
-        msg=f"From: {sender}\r\nTo: {to_email}\r\nSubject: {subject}\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{body}"
-        try:
-            with smtplib.SMTP(host,port,timeout=15) as server:
-                server.starttls(); server.login(user,pw); server.sendmail(sender,[to_email],msg.encode('utf-8'))
-            return True, 'sent via SMTP'
-        except Exception as exc:
-            return False, str(exc)
-    return False, 'Email provider is not configured.'
+    if not _smtp_configured(): return False, 'Email provider is not configured.'
+    host=os.environ.get('SMTP_HOST'); port=int(os.environ.get('SMTP_PORT','587')); user=os.environ.get('SMTP_USER'); pw=os.environ.get('SMTP_PASS'); sender=os.environ.get('EMAIL_FROM')
+    msg=f"From: {sender}\r\nTo: {to_email}\r\nSubject: {subject}\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{body}"
+    try:
+        with smtplib.SMTP(host,port,timeout=15) as server:
+            server.starttls(); server.login(user,pw); server.sendmail(sender,[to_email],msg.encode('utf-8'))
+        return True, 'sent'
+    except Exception as exc:
+        return False, str(exc)
 
 def _send_whatsapp(number, body):
     if not _twilio_configured(): return False, 'WhatsApp provider is not configured.'
@@ -125,7 +99,8 @@ def _send_whatsapp(number, body):
         url=f'https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json'
         r=requests.post(url, data={'From':sender,'To':to,'Body':body}, auth=(sid,token), timeout=15)
         return (200 <= r.status_code < 300), (r.text[:300] if r.status_code>=300 else 'sent')
-    except Exception as exc: return False, str(exc)
+    except Exception as exc:
+        return False, str(exc)
 
 def _user_event_sent(user_id,event_type,event_key):
     con=db(); row=con.execute('SELECT 1 FROM alert_events WHERE user_id=? AND event_type=? AND event_key=?',(user_id,event_type,event_key)).fetchone(); con.close(); return bool(row)
@@ -133,34 +108,24 @@ def _user_event_sent(user_id,event_type,event_key):
 def _mark_event(user_id,event_type,event_key):
     con=db(); con.execute('INSERT OR IGNORE INTO alert_events(user_id,event_type,event_key,sent_at) VALUES(?,?,?,?)',(user_id,event_type,event_key,datetime.now(timezone.utc).isoformat())); con.commit(); con.close()
 
-def _get_alert_state(user_id):
-    con=db(); row=con.execute('SELECT * FROM alert_state WHERE user_id=?',(user_id,)).fetchone(); con.close(); return row
-
-def _set_alert_state(user_id, **fields):
-    cur=_get_alert_state(user_id)
-    now=datetime.now(timezone.utc).isoformat()
-    last_risk=fields.get('last_risk', cur['last_risk'] if cur else None)
-    last_daily_date=fields.get('last_daily_date', cur['last_daily_date'] if cur else None)
-    welcome_sent=fields.get('welcome_sent', cur['welcome_sent'] if cur else 0)
-    con=db(); con.execute('INSERT INTO alert_state(user_id,last_risk,last_daily_date,welcome_sent,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET last_risk=excluded.last_risk,last_daily_date=excluded.last_daily_date,welcome_sent=excluded.welcome_sent,updated_at=excluded.updated_at',(user_id,last_risk,last_daily_date,welcome_sent,now)); con.commit(); con.close()
-
 def _message_for(z,lang,kind):
     risk=z['risk']; district=z['district']; current=z['current']; danger=z['danger']; trend=z['trend_3h_cm']; predicted=z['predicted']
     direction='rising' if trend>0.2 else ('falling' if trend<-0.2 else 'stable')
     if lang=='bn':
-        if kind=='welcome': return f"FloodGuard BD\nআপনার {district} zone-এর flood alert চালু হয়েছে। বর্তমান ঝুঁকি: {risk_label_bn(risk)}।"
-        if kind=='daily': return f"FloodGuard BD — দৈনিক বন্যা আপডেট\n{district}: পানির স্তর {current:.2f} মি; গত ৩ ঘণ্টায় {'বাড়ছে' if direction=='rising' else 'কমছে' if direction=='falling' else 'প্রায় স্থির'}। ঝুঁকি: {risk_label_bn(risk)}। আগামী ২৪ ঘণ্টার আনুমানিক স্তর: {predicted:.2f} মি।"
-        return f"FloodGuard BD সতর্কতা\n{district}-এ ঝুঁকির স্তর {risk_label_bn(risk)} হয়েছে। বর্তমান পানি {current:.2f} মি; রেফারেন্স বিপদসীমা {danger:.2f} মি। স্থানীয় কর্তৃপক্ষের নির্দেশনা অনুসরণ করুন।"
+        if kind=='welcome': return f"FloodGuard BD\nআপনার {district} zone alert subscription চালু হয়েছে। বর্তমান ঝুঁকি: {risk_label_bn(risk)}।"
+        if kind=='daily': return f"FloodGuard BD — দৈনিক আপডেট\n{district}: পানির স্তর {current:.2f} মি; গত ৩ ঘণ্টায় {'বাড়ছে' if direction=='rising' else 'কমছে' if direction=='falling' else 'প্রায় স্থির'}। ঝুঁকি: {risk_label_bn(risk)}। আগামী ২৪ ঘণ্টার পূর্বাভাস: {predicted:.2f} মি।"
+        return f"FloodGuard BD সতর্কতা\n{district}-এ বন্যার ঝুঁকি {risk_label_bn(risk)} পর্যায়ে পরিবর্তিত হয়েছে। বর্তমান পানি {current:.2f} মি; বিপদসীমা {danger:.2f} মি। স্থানীয় কর্তৃপক্ষের নির্দেশনা অনুসরণ করুন।"
     else:
-        if kind=='welcome': return f"FloodGuard BD\nFlood alerts for your {district} zone are now enabled. Current risk: {risk}."
-        if kind=='daily': return f"FloodGuard BD — Daily flood update\n{district}: water level {current:.2f} m; {direction} over the last 3 hours. Risk: {risk}. Next-24h estimate: {predicted:.2f} m."
-        return f"FloodGuard BD alert\nRisk in {district} changed to {risk}. Current water level: {current:.2f} m; danger reference: {danger:.2f} m. Follow local-authority guidance."
+        if kind=='welcome': return f"FloodGuard BD\nYour {district} zone alerts are now enabled. Current risk: {risk}."
+        if kind=='daily': return f"FloodGuard BD — Daily update\n{district}: water level {current:.2f} m; {direction} over the last 3 hours. Risk: {risk}. Next-24h estimate: {predicted:.2f} m."
+        return f"FloodGuard BD alert\nFlood risk in {district} has changed to {risk}. Current water level: {current:.2f} m; danger reference: {danger:.2f} m. Follow local-authority guidance."
 
-def risk_label_bn(r): return {'NORMAL':'স্বাভাবিক','WARNING':'সতর্কতা','FLOOD':'বন্যার ঝুঁকি','SEVERE':'তীব্র ঝুঁকি'}.get(r,r)
+def risk_label_bn(r):
+    return {'NORMAL':'স্বাভাবিক','WARNING':'সতর্কতা','FLOOD':'বন্যার ঝুঁকি','SEVERE':'তীব্র ঝুঁকি'}.get(r,r)
 
 def _dispatch_user_event(row, event_type, event_key, kind, z):
     if _user_event_sent(row['id'],event_type,event_key): return {'sent':False,'skipped':'already_sent'}
-    subject=f"FloodGuard BD — {z['district']} update"
+    subject=f"FloodGuard BD — {z['district']} {z['risk']} alert"
     body=_message_for(z,row['language'] or 'en',kind)
     sent=False; details=[]
     if row['email_alerts'] and row['alerts']:
@@ -172,30 +137,22 @@ def _dispatch_user_event(row, event_type, event_key, kind, z):
 
 def dispatch_alerts():
     now=datetime.now(timezone.utc); today=now.strftime('%Y-%m-%d')
-    con=db(); users=con.execute('SELECT * FROM users WHERE alerts=1').fetchall(); con.close(); results=[]
+    con=db(); users=con.execute('SELECT * FROM users WHERE alerts=1').fetchall(); con.close()
+    results=[]
     for row in users:
         try:
             z=package_station(row['zone'] if row['zone'] in STATIONS else 'mymensingh')
-            state=_get_alert_state(row['id'])
-            # First run after enabling alerts: welcome + initialize state.
-            if not state or not state['welcome_sent']:
-                r=_dispatch_user_event(row,'welcome','v1','welcome',z); results.append(r)
-                if r.get('sent') or not (row['email_alerts'] or row['whatsapp_alerts']): _set_alert_state(row['id'],welcome_sent=1,last_risk=z['risk'])
-            else:
-                # Notify only when risk actually changes.
-                if state['last_risk'] and state['last_risk'] != z['risk']:
-                    r=_dispatch_user_event(row,'risk_change',f"{state['last_risk']}->{z['risk']}",'change',z); results.append(r)
-                    if r.get('sent'): _set_alert_state(row['id'],last_risk=z['risk'])
-                elif not state['last_risk']:
-                    _set_alert_state(row['id'],last_risk=z['risk'])
-            state=_get_alert_state(row['id'])
-            if not state or state['last_risk'] == z['risk']:
-                if not state or state['last_daily_date'] != today:
-                    r=_dispatch_user_event(row,'daily',today,'daily',z); results.append(r)
-                    if r.get('sent'): _set_alert_state(row['id'],last_daily_date=today,last_risk=z['risk'])
+            # one-time welcome on first alert-enabled account
+            results.append(_dispatch_user_event(row,'welcome','v1','welcome',z))
+            # daily digest
+            results.append(_dispatch_user_event(row,'daily',today,'daily',z))
+            # situation-change event keyed to current risk + date to avoid repeated spam
+            event_key=f"{today}:{z['risk']}"
+            results.append(_dispatch_user_event(row,'risk_change',event_key,'change',z))
         except Exception as exc: results.append({'sent':False,'error':str(exc)})
     return results
 
+_ALERT_THREAD_STARTED=False
 def _alert_loop():
     while True:
         try: dispatch_alerts()
@@ -231,12 +188,6 @@ def trigger_live_refresh(force=False):
             return False
         _worker_running=True
         threading.Thread(target=_live_worker, daemon=True).start(); return True
-
-# Start notification worker on WSGI import so Gunicorn/Render also processes scheduled alerts.
-try:
-    start_alert_loop()
-except Exception:
-    pass
 
 @app.before_request
 def _ensure_background_live_sync():
@@ -421,28 +372,6 @@ def profile():
     if not uid:return jsonify({'ok':False,'error':'Login required.'}),401
     data=request.get_json(force=True); zone=data.get('zone') if data.get('zone') in STATIONS else 'mymensingh'; lang=data.get('language') if data.get('language') in {'en','bn'} else 'en'; wa=(data.get('whatsapp') or '').strip(); alerts=1 if data.get('alerts') else 0; email_alerts=1 if data.get('email_alerts',True) else 0; whatsapp_alerts=1 if data.get('whatsapp_alerts',True) else 0
     con=db(); con.execute('UPDATE users SET zone=?,language=?,whatsapp=?,alerts=?,email_alerts=?,whatsapp_alerts=? WHERE id=?',(zone,lang,wa,alerts,email_alerts,whatsapp_alerts,uid)); con.commit(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close(); return jsonify({'ok':True,'user':dict_user(row),'email_configured':_smtp_configured(),'whatsapp_configured':_twilio_configured()})
-
-@app.post('/api/alerts/test-email')
-def test_email():
-    uid=session.get('uid')
-    if not uid:return jsonify({'ok':False,'error':'Login required.'}),401
-    con=db(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close()
-    if not row:return jsonify({'ok':False,'error':'Account not found.'}),404
-    z=package_station(row['zone'] if row['zone'] in STATIONS else 'mymensingh')
-    body=_message_for(z,row['language'] or 'en','daily')
-    ok,detail=_send_email(row['email'],'FloodGuard BD — Test email',body)
-    return jsonify({'ok':ok,'detail':detail})
-
-@app.post('/api/alerts/enable')
-def enable_alerts():
-    uid=session.get('uid')
-    if not uid:return jsonify({'ok':False,'error':'Login required.'}),401
-    con=db(); row=con.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone(); con.close()
-    if not row:return jsonify({'ok':False,'error':'Account not found.'}),404
-    z=package_station(row['zone'] if row['zone'] in STATIONS else 'mymensingh')
-    now=datetime.now(timezone.utc).isoformat()
-    _set_alert_state(uid,last_risk=z['risk'],welcome_sent=0,last_daily_date=None)
-    return jsonify({'ok':True,'message':'Alerts enabled. A welcome email will be sent on the next alert cycle.'})
 
 @app.post('/api/alerts/dispatch')
 def alerts_dispatch():
