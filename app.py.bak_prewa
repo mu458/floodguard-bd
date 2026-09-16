@@ -83,8 +83,8 @@ def _email_configured():
 def _smtp_configured():
     return bool(os.environ.get('SMTP_HOST') and os.environ.get('SMTP_USER') and os.environ.get('SMTP_PASS') and os.environ.get('EMAIL_FROM'))
 
-def _whatsapp_bridge_configured():
-    return bool(_email_script_url())
+def _twilio_configured():
+    return bool(os.environ.get('TWILIO_ACCOUNT_SID') and os.environ.get('TWILIO_AUTH_TOKEN') and os.environ.get('TWILIO_WHATSAPP_FROM'))
 
 def _send_email(to_email, subject, body):
     # Primary path: Google Apps Script -> Gmail. Optional SMTP fallback remains available.
@@ -117,22 +117,15 @@ def _send_email(to_email, subject, body):
     return False, 'Email provider is not configured.'
 
 def _send_whatsapp(number, body):
-    # WhatsApp is sent through the same Google Apps Script bridge.
-    # The script holds the WhatsApp Cloud API credentials in Script Properties.
-    url=_email_script_url()
-    if not url: return False, 'WhatsApp bridge is not configured.'
+    if not _twilio_configured(): return False, 'WhatsApp provider is not configured.'
     try:
         import requests
-        r=requests.post(url, json={'action':'send_whatsapp','to':number,'body':body}, timeout=20)
-        if 200 <= r.status_code < 300:
-            try:
-                out=r.json()
-                return bool(out.get('ok')), out.get('error') or ('sent via Google Apps Script' if out.get('ok') else 'WhatsApp send failed')
-            except Exception:
-                return True, 'sent via Google Apps Script'
-        return False, f'WhatsApp bridge HTTP {r.status_code}'
-    except Exception as exc:
-        return False, str(exc)
+        sid=os.environ['TWILIO_ACCOUNT_SID']; token=os.environ['TWILIO_AUTH_TOKEN']; sender=os.environ['TWILIO_WHATSAPP_FROM']
+        to=number if number.startswith('whatsapp:') else 'whatsapp:'+number
+        url=f'https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json'
+        r=requests.post(url, data={'From':sender,'To':to,'Body':body}, auth=(sid,token), timeout=15)
+        return (200 <= r.status_code < 300), (r.text[:300] if r.status_code>=300 else 'sent')
+    except Exception as exc: return False, str(exc)
 
 def _user_event_sent(user_id,event_type,event_key):
     con=db(); row=con.execute('SELECT 1 FROM alert_events WHERE user_id=? AND event_type=? AND event_key=?',(user_id,event_type,event_key)).fetchone(); con.close(); return bool(row)
@@ -460,7 +453,7 @@ def profile():
         immediate.append(_dispatch_user_event(row,'zone_change',f'{old_zone}->{zone}','change',z))
         _set_alert_state(uid,last_risk=z['risk'])
 
-    return jsonify({'ok':True,'user':dict_user(row),'email_configured':_email_configured(),'whatsapp_configured':_whatsapp_bridge_configured(),'immediate':immediate})
+    return jsonify({'ok':True,'user':dict_user(row),'email_configured':_email_configured(),'whatsapp_configured':_twilio_configured(),'immediate':immediate})
 
 @app.post('/api/alerts/test-email')
 def test_email():
