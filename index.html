@@ -81,6 +81,64 @@ button,input,select{font:inherit}.app{min-height:100vh}.topnav{position:sticky;t
 .hazard-card{display:flex;align-items:flex-start;gap:12px;min-height:92px}.hazard-icon{font-size:26px}.feature-grid{grid-template-columns:1fr 1fr}.mini-days{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.mini-day{border:1px solid var(--line);border-radius:14px;padding:10px;display:grid;gap:6px;text-align:center;background:var(--panel)}.mini-day strong{font-size:10px;color:var(--muted)}.mini-day span{font-size:21px}.mini-day b{font:800 18px Manrope}.mini-day small{font-size:10px;color:var(--muted)}.empty-state{padding:18px;border:1px dashed var(--line);border-radius:14px;color:var(--muted);display:grid;gap:6px}.empty-state strong{color:var(--text)}.chart-tall{height:320px}.svg-chart{width:100%;height:100%;color:var(--blue)}.field{display:grid;gap:6px}.field label{font-size:10px;color:var(--muted);font-weight:800;text-transform:uppercase}.form-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}@media(max-width:1000px){.form-grid,.feature-grid{grid-template-columns:1fr 1fr}.mini-days{grid-template-columns:repeat(5,minmax(90px,1fr));overflow:auto}}@media(max-width:700px){.form-grid,.feature-grid{grid-template-columns:1fr}.mini-days{grid-template-columns:repeat(5,110px)}}
 </style>
 
+
+<style>
+/* v5090 cinematic polish: visual-only layer, preserves existing structure/functionality */
+:root{--glow:0 0 80px rgba(18,168,216,.16)}
+body{background-attachment:fixed}
+body:before{content:"";position:fixed;inset:-20%;pointer-events:none;z-index:-1;background:
+ radial-gradient(circle at 12% 16%,rgba(18,168,216,.10),transparent 22%),
+ radial-gradient(circle at 88% 12%,rgba(11,114,216,.10),transparent 20%),
+ radial-gradient(circle at 52% 96%,rgba(11,155,104,.08),transparent 24%);animation:bgDrift5090 18s ease-in-out infinite alternate}
+@keyframes bgDrift5090{from{transform:translate3d(-1%,0,0) scale(1)}to{transform:translate3d(1%,1%,0) scale(1.04)}}
+.topnav{box-shadow:0 10px 40px rgba(9,47,77,.06)}
+.nav button{position:relative;overflow:hidden}
+.nav button:after{content:"";position:absolute;left:14%;right:14%;bottom:4px;height:2px;border-radius:99px;background:linear-gradient(90deg,var(--blue),var(--cyan));transform:scaleX(0);transform-origin:center;transition:.25s}
+.nav button.active:after,.nav button:hover:after{transform:scaleX(1)}
+.brand-mark{box-shadow:0 0 0 1px rgba(255,255,255,.22) inset,0 12px 35px rgba(11,114,216,.3)}
+.hero{min-height:420px;box-shadow:0 32px 100px rgba(2,57,96,.24),inset 0 1px 0 rgba(255,255,255,.12)}
+.hero:global{}
+.hero{background:
+ radial-gradient(circle at 86% 24%,rgba(125,244,255,.22),transparent 18%),
+ radial-gradient(circle at 74% 92%,rgba(25,183,125,.18),transparent 20%),
+ linear-gradient(135deg,#061c34 0%,#0a4e88 44%,#0c88b1 72%,#0da58c 120%)}
+.hero:before{mix-blend-mode:screen;filter:blur(.2px);opacity:.9}
+.hero:after{box-shadow:0 -18px 60px rgba(125,232,255,.08);border-radius:50% 50% 0 0}
+.hero-grid:before{content:"";position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(100deg,transparent 0 46px,rgba(255,255,255,.025) 47px 48px);mask-image:linear-gradient(90deg,transparent,#000 20%,#000 80%,transparent);animation:gridShift5090 16s linear infinite}
+@keyframes gridShift5090{to{transform:translateX(48px)}}
+.eyebrow{box-shadow:0 0 0 1px rgba(255,255,255,.04) inset,0 0 26px rgba(113,232,255,.10)}
+.hero h1{text-shadow:0 8px 35px rgba(0,0,0,.16)}
+.hero p{max-width:730px}
+.hero-actions .btn{box-shadow:0 12px 30px rgba(0,0,0,.12)}
+.hero-card-dramatic{border-radius:28px!important;box-shadow:0 18px 55px rgba(0,0,0,.16),inset 0 1px 0 rgba(255,255,255,.14);backdrop-filter:blur(16px);transform:perspective(900px) rotateY(-4deg);transition:transform .45s ease,box-shadow .45s ease}
+.hero-card-dramatic:hover{transform:perspective(900px) rotateY(0) translateY(-6px);box-shadow:0 28px 70px rgba(0,0,0,.22),inset 0 1px 0 rgba(255,255,255,.16)}
+.hero-scan{box-shadow:inset 0 0 35px rgba(125,232,255,.05)}
+.wave{filter:drop-shadow(0 6px 22px rgba(125,232,255,.16))}
+.kicker{margin-top:28px}
+.kicker h2{font-size:23px}
+.grid .card{background:linear-gradient(180deg,rgba(255,255,255,.94),rgba(255,255,255,.86));backdrop-filter:blur(14px)}
+.dark .grid .card{background:linear-gradient(180deg,rgba(13,34,52,.96),rgba(10,28,43,.94))}
+.card{box-shadow:0 16px 48px rgba(25,61,93,.08),0 0 0 1px rgba(255,255,255,.34) inset}
+.card:hover{transform:translateY(-5px) scale(1.003);box-shadow:0 28px 72px rgba(25,61,93,.14),0 0 0 1px rgba(18,168,216,.12) inset}
+.stat{min-height:124px}
+.stat:before{content:"";position:absolute;left:0;top:0;width:100%;height:3px;background:linear-gradient(90deg,var(--blue),var(--cyan),transparent);opacity:.8}
+.stat .value{letter-spacing:-.045em}
+.btn{box-shadow:0 6px 18px rgba(25,61,93,.05)}
+.btn.primary{box-shadow:0 13px 30px rgba(11,114,216,.27)}
+.btn.primary:hover{filter:brightness(1.05);box-shadow:0 17px 38px rgba(11,114,216,.34)}
+select,input{transition:border-color .2s,box-shadow .2s,transform .2s}
+select:focus,input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 4px rgba(11,114,216,.10)}
+.insight-box,.hazard-card,.feature-card{position:relative;overflow:hidden}
+.insight-box:before,.hazard-card:before,.feature-card:before{content:"";position:absolute;inset:0;background:linear-gradient(120deg,transparent 30%,rgba(255,255,255,.09) 50%,transparent 70%);transform:translateX(-120%);animation:sheen5090 7s ease-in-out infinite;pointer-events:none}
+@keyframes sheen5090{0%,58%{transform:translateX(-120%)}74%,100%{transform:translateX(120%)}}
+/* More dramatic earthquake center */
+.eq-visual{box-shadow:inset 0 0 50px rgba(11,114,216,.05),0 12px 32px rgba(25,61,93,.07)}
+.eq-radar{box-shadow:inset 0 0 50px rgba(11,114,216,.07),0 0 35px rgba(11,114,216,.06)}
+.eq-radar:after{background:linear-gradient(90deg,transparent,rgba(18,168,216,.32),transparent)}
+.footer{opacity:.9}
+/* Accessibility / reduced motion */
+@media(prefers-reduced-motion:reduce){body:before,.hero-grid:before,.insight-box:before,.hazard-card:before,.feature-card:before{animation:none!important}.hero-card-dramatic{transform:none!important}.card{transition:none!important}}
+</style>
 </head>
 <body>
 <div class="app">
@@ -334,5 +392,8 @@ function showPage(id){document.querySelectorAll('.page').forEach(s=>s.classList.
 document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>showPage(b.dataset.target));document.querySelectorAll('[data-scroll]').forEach(b=>b.onclick=()=>showPage(b.dataset.scroll));$('refreshHazards')?.addEventListener('click',loadHazardCenter);$('runSimulation')?.addEventListener('click',runSimulation);document.querySelectorAll('[data-filter]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-filter]').forEach(x=>x.classList.remove('active'));b.classList.add('active');mapFilter=b.dataset.filter;renderMap()});$('loginBtn').onclick=async()=>{const m=await getJSON('/api/auth/me');if(m.logged_in){await getJSON('/api/auth/logout',{method:'POST'});await loadAccount();toast('Logged out')}else openAuth('login')};$('closeModal').onclick=()=>$('modal').classList.add('hidden');$('switchAuth').onclick=()=>openAuth(authMode==='login'?'register':'login');$('submitAuth').onclick=auth;$('saveProfile').onclick=saveProfile;$('testEmail').onclick=testEmail;document.body.classList.toggle('dark',localStorage.getItem('fg_dark')==='true');
 async function boot(){try{await loadZones();await loadAccount();await loadDashboard(currentZone);applyLang();showPage('dashboard');try{initSimulation()}catch(e){}if(!refreshTimer)refreshTimer=setInterval(async()=>{const chosen=currentZone;try{await getJSON('/api/live-refresh?force=0');await loadZones();await loadDashboard(chosen)}catch(e){}},300000)}catch(e){toast('Could not load dashboard: '+e.message)}}boot();
 </script>
+<div class="page-progress5090" aria-hidden="true"></div>
+<style>.page-progress5090{position:fixed;left:0;top:0;width:0;height:3px;background:linear-gradient(90deg,#0b72d8,#12a8d8,#20c997);z-index:9999;box-shadow:0 0 16px rgba(18,168,216,.6);transition:width .1s linear}</style>
+<script>document.addEventListener('scroll',()=>{const h=document.documentElement.scrollHeight-window.innerHeight;document.querySelector('.page-progress5090').style.width=(h?((scrollY/h)*100):0)+'%';},{passive:true});</script>
 </body>
 </html>
